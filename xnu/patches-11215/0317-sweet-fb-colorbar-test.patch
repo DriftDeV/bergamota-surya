@@ -1,0 +1,162 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] sweetfbtest=N color bars straight into the panel memory (community patch 0261 from goose-archives/Bergamota develop, renumbered 0317)
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -481,6 +481,7 @@
+ 	AppleARMBacklight *fBacklight;
+ 	void          blRequest(uint32_t level) { __atomic_store_n(&fBlReq, level | 0x80000000u, __ATOMIC_RELEASE); }
+ 	void          blackout(void);
++	void          testBars(void);   /* 0261: sweetfbtest, color bars over the whole panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -495,6 +496,11 @@
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	bool          fEmptyBlackArmed;       /* 0233: the next layerless swap may blank (boot, and once after each power on) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* 0261: sweetfbtest=N, color bars painted straight into the panel memory, swaps ignored, for N seconds */
++	uint64_t      fTestUntil;     /* absolute deadline, 0 = off */
++	uint32_t      fTestTick;      /* vsync ticks since the last repaint */
++	uint32_t      fTestBlTries;   /* backlight re-asserts (bounded) */
++	uint32_t      fTestLogged;    /* the MDP scan address was logged once */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -862,6 +868,37 @@
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d), direct %d early %d\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fVsyncUS, fFlushTicks,
+ 	    fScale, fPadX, fPadY, fDirect ? 1 : 0, fEarly ? 1 : 0);
++	/*
++	 * 0261: sweetfbtest=N paints color bars into the panel memory, holds them for N seconds and ignores every
++	 * swap, so the panel path (MDP scanout, DSI, WLED) can be checked without iOS presenting anything. The
++	 * bootloader's own screen is still on the panel: frame 0 is ABL's framebuffer, nothing has swapped yet.
++	 */
++	{
++		uint32_t secs = 0;
++		PE_parse_boot_argn("sweetfbtest", &secs, sizeof(secs));
++		if (secs != 0) {
++			clock_interval_to_deadline(secs * 1000, 1000, &fTestUntil);
++			fTestTick = 0;
++			fTestLogged = 0;
++			if (fFlip && (fFront != 0 || fHwOn)) {
++				scanTo(0);
++			}
++			/*
++			 * An AMOLED panel is dark without the WLED no matter what is scanned, and blInit() gives up
++			 * when the bootloader left the strings at 0 (handoff does not touch them), so force full here.
++			 */
++			blInit();
++			fBlRaw[0] = fBlRaw[1] = 0xfff;
++			if (blSet(true)) {
++				fBlOK = true;
++			}
++			testBars();
++			IOLog("SWEET FBTEST: color bars for %u s: %ux%u frame 0 at 0x%llx (stride %u), blOK %d, px00 0x%08x pxmid 0x%08x\n",
++			    secs, fWidth, fHeight, fPhys, fRowBytes, fBlOK ? 1 : 0,
++			    ((uint32_t *)fPixels)[0],
++			    ((uint32_t *)(fPixels + (uintptr_t)(fHeight / 2) * fRowBytes))[fWidth / 2]);
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -931,6 +968,22 @@
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	if (fb->fTestUntil != 0) {
++		if (now < fb->fTestUntil) {
++			/* 0261: hold the bars: repaint twice a second, keep the WLED lit (the panel is AMOLED) */
++			if ((++fb->fTestTick % 15) == 0) {
++				fb->testBars();
++				if (fb->fBlOK && fb->fBlPos != SWEET_FB_BL_STEPS && fb->fTestBlTries < 5) {
++					fb->fTestBlTries++;
++					(void)fb->blSet(true);
++				}
++			}
++			sender->setTimeoutUS(fb->fVsyncUS);
++			return;
++		}
++		fb->fTestUntil = 0;
++		IOLog("SWEET FBTEST: done, normal presentation resumes\n");
++	}
+ 	/*
+ 	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
+ 	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
+@@ -1286,6 +1339,14 @@
+ {
+ 	SweetSurface *held[4] = {}, *dropped[4];
+ 	uint32_t mask = get32(rec, 0x104);
++	if (fTestUntil != 0 && mach_absolute_time() < fTestUntil) {
++		/* 0261: the self test owns the panel. Count the swap so SwapWait answers, present nothing. */
++		IOLockLock(fLock);
++		fSt.swaps++;
++		__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
++		IOLockUnlock(fLock);
++		return;
++	}
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+ 		uint32_t sid = get32(rec, 0x54 + 4 * i);
+ 		if ((mask & (1u << i)) && sid != 0 && (held[i] = sweet_surface_copy(sid)) != NULL) {
+@@ -1842,6 +1903,47 @@
+ }
+ 
+ /*
++ * 0261: eight horizontal SMPTE-ish bars over the whole panel, plus a white strip at the left edge, so a
++ * shifted/clipped scanout is obvious. Called from start() and from the vsync timer (iOS may write into the
++ * same memory, the bars are put back). fPixels is the kernel mapping of the boot framebuffer, which is frame 0,
++ * the buffer the MDP scans until the first swap.
++ */
++void
++AppleCLCD::testBars(void)
++{
++	static const uint32_t colors[8] = {
++		0xffffffff, 0xffffff00, 0xff00ffff, 0xff00ff00,
++		0xffff00ff, 0xffff0000, 0xff0000ff, 0xff000000,
++	};
++	uint32_t *base = (uint32_t *)fPixels;
++	const uint32_t bw = fWidth / 32;                 /* the white marker: 1/32 of the width */
++
++	if (base == 0 || fRowBytes == 0 || fHeight == 0) {
++		return;
++	}
++	for (uint32_t y = 0; y < fHeight; y++) {
++		uint32_t c = colors[(uint64_t)y * 8 / fHeight];
++		uint32_t *row = (uint32_t *)((uintptr_t)base + (uintptr_t)y * fRowBytes);
++		for (uint32_t x = 0; x < fWidth; x++) {
++			row[x] = x < bw ? 0xffffffff : c;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (fTestLogged) {
++		return;
++	}
++	fTestLogged = 1;
++	uint32_t src = 0, stride = 0;
++	if (fMdp != 0 && fPipe >= 0) {
++		volatile uint32_t *p = (volatile uint32_t *)(fMdp + sweet_mdp_pipes[fPipe].off);
++		src = p[SSPP_SRC0_ADDR / 4];
++		stride = p[SSPP_YSTRIDE0 / 4];
++	}
++	IOLog("SWEET FBTEST: bars on the panel: the MDP scans 0x%x stride 0x%x (frame 0 is 0x%llx, %ux%u stride %u), front %u hw %d\n",
++	    src, stride, fPhys, fWidth, fHeight, fRowBytes, fFront, fHwOn ? 1 : 0);
++}
++
++/*
+  * Clean (not invalidate) a CPU-written range to the point of coherency: the
+  * MDP reads DRAM. This build is __ARM_COHERENT_IO__, where the kernel's own
+  * flush_dcache64/clean_dcache64 are bare "dsb sy", so it is done by hand.
+@@ -3656,8 +3758,10 @@
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+-			if (off && sweet_fb_keepon) {
+-				IOLog("SWEET FB: display off ignored (sweetfb_keepon=1)\n");
++			if (off && (sweet_fb_keepon ||
++			    (fFB->fTestUntil != 0 && mach_absolute_time() < fFB->fTestUntil))) {
++				IOLog("SWEET FB: display off ignored (%s)\n",
++				    sweet_fb_keepon ? "sweetfb_keepon=1" : "sweetfbtest");
+ 				break;
+ 			}
+ 			IOLockLock(fFB->fLock);

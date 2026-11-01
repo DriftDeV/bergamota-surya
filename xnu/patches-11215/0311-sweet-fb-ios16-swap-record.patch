@@ -1,0 +1,59 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] accept the iOS 16.5 0x46c framebuffer swap record (community patch 0255 from goose-archives/Bergamota develop, renumbered 0311)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -146,7 +146,8 @@
+ 	kSweetFBNotifications           = 72,
+ };
+ 
+-#define SWEET_FB_SWAP_REC_SIZE          0x46c
++#define SWEET_FB_SWAP_REC_SIZE          0x46c   /* iOS 16 layout */
++#define SWEET_FB_SWAP_REC_18_SIZE       0x514   /* iOS 18 layout, fields +0x48 */
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -3519,6 +3520,10 @@
+ 		break;
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++		uint8_t raw[SWEET_FB_SWAP_REC_18_SIZE];
++		const uint8_t *in = raw;
++		uint32_t insz = args->structureInputSize;
++		uint32_t nraw = insz < (uint32_t)sizeof(raw) ? insz : (uint32_t)sizeof(raw);
+ 		/*
+ 		 * iOS 18 IOMobileFramebuffer sends a 0x514 byte record (client+0x18) whose fields sit 0x48 bytes later than
+ 		 * the iOS 16 record this driver was written for (read from IOMobileFramebufferSwapSetLayer/SwapBegin):
+@@ -3526,10 +3531,28 @@
+ 		 *   +0x15c + 4*i layer flags; there is no layer mask (a layer is in use when its surface id != 0).
+ 		 * Translate into the legacy layout (id 0x50/0x54, rects 0x64/0xc4, mask 0x104) so nothing else changes.
+ 		 * Without this every swap looked empty (mask 0): backboardd presented 5000 frames and the panel stayed black.
++		 * iOS 16.5 still sends the 0x46c record this driver was written for, and IOMobileFramebuffer may pass it out
++		 * of line (structureInputDescriptor). Accepting only >= 0x514 made every iOS 16.5 SwapEnd (0x46c) return
++		 * kIOReturnBadArgument, so backboardd gave up and never presented a frame: the panel kept Enxerto's last image.
+ 		 */
+-		const uint8_t *in = (const uint8_t *)args->structureInput;
+-		if (args->structureInputDescriptor != NULL || args->structureInputSize < 0x514) {
+-			ret = kIOReturnBadArgument;
++		if (args->structureInputDescriptor != NULL) {
++			insz = (uint32_t)args->structureInputDescriptor->getLength();
++			nraw = insz < (uint32_t)sizeof(raw) ? insz : (uint32_t)sizeof(raw);
++			if (insz < SWEET_FB_SWAP_REC_SIZE ||
++			    args->structureInputDescriptor->readBytes(0, raw, nraw) != nraw) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++		} else {
++			if (args->structureInput == NULL || insz < SWEET_FB_SWAP_REC_SIZE) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++			memcpy(raw, args->structureInput, nraw);
++		}
++		if (insz < SWEET_FB_SWAP_REC_18_SIZE) {
++			memcpy(rec, in, sizeof(rec));
++			fFB->swap(rec);
+ 			break;
+ 		}
+ 		bzero(rec, sizeof(rec));

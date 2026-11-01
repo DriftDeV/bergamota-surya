@@ -1,0 +1,50 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] USB live-log notes (community patch 0256 from goose-archives/Bergamota develop, renumbered 0312)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1039,8 +1039,10 @@
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
++	int said = 0;           /* one-off notes: 1 socket, 2 send error, 4 first bytes */
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
++	printf("SWEET USB: live log thread started at %llu of %llu\n", pos, sweet_log_position());
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+@@ -1053,6 +1055,10 @@
+ 		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
++			if (!(said & 1)) {
++				said |= 1;
++				printf("SWEET USB: live log: sock_socket failed\n");
++			}
+ 			continue;
+ 		}
+ 		uint32_t n;
+@@ -1064,11 +1070,20 @@
+ 				.msg_iov = &iov, .msg_iovlen = 1,
+ 			};
+ 			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
++			int err = sock_send(so, &msg, 0, &sent);
++			if (err != 0) {
+ 				/* no route/ARP yet (host not configured): keep the chunk for the next try */
++				if (!(said & 2)) {
++					said |= 2;
++					printf("SWEET USB: live log: sock_send failed, errno %d\n", err);
++				}
+ 				pos = sent_upto;
+ 				break;
+ 			}
++			if (!(said & 4)) {
++				said |= 4;
++				printf("SWEET USB: live log: first %u bytes sent\n", n);
++			}
+ 			sent_upto = pos;
+ 		}
+ 	}

@@ -1,0 +1,80 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] sample early and often, dump the first non-empty swap record (community patch 0258 from goose-archives/Bergamota develop, renumbered 0314)
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,8 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * First sample 90 s after start, then every 120 s, 40 samples at most.
++ * First sample 10 s after start, then every 30 s, 30 samples at most (a boot
++ * that ends early still gets a few).
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -25,6 +26,7 @@
+ extern void sweet_sample_start(void);
+ 
+ static char sweet_sample_names[128];
++static int sweet_sample_scanned;
+ 
+ static bool
+ sweet_sample_wanted(const char *name)
+@@ -50,6 +52,7 @@
+ sweet_sample_proc(proc_t p, __unused void *arg)
+ {
+ 	char name[32];
++	sweet_sample_scanned++;
+ 	proc_name(proc_pid(p), name, sizeof(name));
+ 	if (sweet_sample_wanted(name)) {
+ 		task_t task = proc_task(p);
+@@ -70,11 +73,14 @@
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
++	printf("SMP start hz=%d names=%s\n", hz, sweet_sample_names);
++	(void)tsleep(&chan, PZERO, "sweetsmp", 10 * hz);
++	for (int i = 0; i < 30; i++) {
+ 		printf("SMP --- sample %d\n", i);
++		sweet_sample_scanned = 0;
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		printf("SMP scanned %d\n", sweet_sample_scanned);
++		(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3554,7 +3554,7 @@
+ 			memcpy(raw, args->structureInput, nraw);
+ 		}
+ 		if (insz < SWEET_FB_SWAP_REC_18_SIZE) {
+-			static uint32_t recDumps;
++			static uint32_t recDumps, recLayerDumps;
+ 			memcpy(rec, in, sizeof(rec));
+ 			if (recDumps < 2) {
+ 				recDumps++;
+@@ -3581,6 +3581,17 @@
+ 				    (int32_t)get32(rec, 0x70), (int32_t)get32(rec, 0xc4), (int32_t)get32(rec, 0xc8),
+ 				    (int32_t)get32(rec, 0xcc), (int32_t)get32(rec, 0xd0));
+ 			}
++			if (recLayerDumps < 2 &&
++			    (get32(rec, 0x104) != 0 || get32(rec, 0x54) != 0)) {
++				recLayerDumps++;
++				IOLog("SWEET FB: recL id %u mask 0x%x dis 0x%x ids %u %u %u %u src %d,%d %dx%d dst %d,%d %dx%d\n",
++				    get32(rec, 0x50), get32(rec, 0x104), get32(rec, 0x108),
++				    get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60),
++				    (int32_t)get32(rec, 0x64), (int32_t)get32(rec, 0x68),
++				    (int32_t)get32(rec, 0x6c), (int32_t)get32(rec, 0x70),
++				    (int32_t)get32(rec, 0xc4), (int32_t)get32(rec, 0xc8),
++				    (int32_t)get32(rec, 0xcc), (int32_t)get32(rec, 0xd0));
++			}
+ 			fFB->swap(rec);
+ 			break;
+ 		}

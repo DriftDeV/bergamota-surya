@@ -1,0 +1,15 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] start the USB live-log thread before the ECM interface exists (community patch 0259 from goose-archives/Bergamota develop, renumbered 0315)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1344,7 +1344,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+-	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (livelog && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }

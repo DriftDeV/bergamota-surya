@@ -1,0 +1,241 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] serve the iOS 16 out-of-line mach_ports_register/lookup ABI (community patch 0254 from goose-archives/Bergamota develop, renumbered 0310)
+
+diff --git a/osfmk/kern/ipc_tt.c b/osfmk/kern/ipc_tt.c
+index e08c000..5fbcbea 100644
+--- a/osfmk/kern/ipc_tt.c
++++ b/osfmk/kern/ipc_tt.c
+@@ -74,6 +74,7 @@
+ #include <mach/mach_types.h>
+ #include <mach/boolean.h>
+ #include <mach/kern_return.h>
++#include <mach/message.h>
+ #include <mach/mach_param.h>
+ #include <mach/task_special_ports.h>
+ #include <mach/thread_special_ports.h>
+@@ -2374,22 +2375,23 @@ out:
+  *		KERN_INVALID_ARGUMENT	Too many port rights supplied.
+  */
+ 
+-kern_return_t
+-_kernelrpc_mach_ports_register3(
++/*
++ *	Stash a set of port send rights in a task's inheritance slot.
++ *	Consumes the references in @ports on success; on failure the
++ *	caller keeps ownership (the request message is destroyed).
++ */
++static kern_return_t
++task_ports_register_internal(
+ 	task_t                  task,
+-	mach_port_t             port1,
+-	mach_port_t             port2,
+-	mach_port_t             port3)
++	ipc_port_t              ports[TASK_PORT_REGISTER_MAX])
+ {
+-	ipc_port_t ports[TASK_PORT_REGISTER_MAX] = {
+-		port1, port2, port3,
+-	};
++	int i;
+ 
+ 	if (task == TASK_NULL) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
+-	for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++	for (i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
+ 		if (IP_VALID(ports[i]) && ports[i]->ip_immovable_send) {
+ 			return KERN_INVALID_RIGHT;
+ 		}
+@@ -2406,7 +2408,7 @@ _kernelrpc_mach_ports_register3(
+ 	 *	Release the old rights after unlocking.
+ 	 */
+ 
+-	for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++	for (i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
+ 		ipc_port_t old;
+ 
+ 		old = task->itk_registered[i];
+@@ -2416,13 +2418,89 @@ _kernelrpc_mach_ports_register3(
+ 
+ 	itk_unlock(task);
+ 
+-	for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
+-		ipc_port_release_send(ports[i]);
++	for (i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++		if (IP_VALID(ports[i])) {
++			ipc_port_release_send(ports[i]);
++		}
+ 	}
+ 
+ 	return KERN_SUCCESS;
+ }
+ 
++/*
++ *	Routine:	mach_ports_register [kernel call]
++ *	Purpose:
++ *		Stash a handful of port send rights in the task.
++ *		Child tasks will inherit these rights, but they
++ *		must use mach_ports_lookup to acquire them.
++ *
++ *		The rights are supplied in a (wired) kalloc'd segment.
++ *		Rights which aren't supplied are assumed to be null.
++ *	Conditions:
++ *		Nothing locked.  If successful, consumes
++ *		the supplied rights and memory.
++ *	Returns:
++ *		KERN_SUCCESS		    Stashed the port rights.
++ *		KERN_INVALID_RIGHT	    Port in array is marked immovable.
++ *		KERN_INVALID_ARGUMENT	The task is null.
++ *		KERN_INVALID_ARGUMENT	The task is dead.
++ *		KERN_INVALID_ARGUMENT	The memory param is null.
++ *		KERN_INVALID_ARGUMENT	Too many port rights supplied.
++ *
++ *	This is the pre-xnu-10002 wire format (out-of-line port array);
++ *	iOS 16 and older libsyscall still speaks it.  See task.defs.
++ */
++kern_return_t
++mach_ports_register(
++	task_t                  task,
++	mach_port_array_t       memory,
++	mach_msg_type_number_t  portsCnt)
++{
++	ipc_port_t ports[TASK_PORT_REGISTER_MAX];
++	kern_return_t kr;
++	unsigned int i;
++
++	if ((task == TASK_NULL) ||
++	    (portsCnt > TASK_PORT_REGISTER_MAX) ||
++	    (portsCnt && memory == NULL)) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	printf("SWEET: mach_ports_register legacy ABI, %u port(s)\n", portsCnt);
++
++	for (i = 0; i < portsCnt; i++) {
++		ports[i] = memory[i].port;
++	}
++	for (; i < TASK_PORT_REGISTER_MAX; i++) {
++		ports[i] = IP_NULL;
++	}
++
++	kr = task_ports_register_internal(task, ports);
++	if (kr == KERN_SUCCESS && portsCnt != 0) {
++		/* The rights moved into itk_registered; drop the array. */
++		mach_port_array_free(memory, portsCnt);
++	}
++	return kr;
++}
++
++/*
++ *	Three inline descriptors variant (xnu-10002 and later libsyscall),
++ *	also used by execve()/posix_spawn() port actions inside the kernel.
++ */
++kern_return_t
++_kernelrpc_mach_ports_register3(
++	task_t                  task,
++	mach_port_t             port1,
++	mach_port_t             port2,
++	mach_port_t             port3)
++{
++	ipc_port_t ports[TASK_PORT_REGISTER_MAX] = {
++		port1, port2, port3,
++	};
++
++	return task_ports_register_internal(task, ports);
++}
++
+ /*
+  *	Routine:	mach_ports_lookup [kernel call]
+  *	Purpose:
+@@ -2436,30 +2514,36 @@ _kernelrpc_mach_ports_register3(
+  *		KERN_INVALID_ARGUMENT	The task is dead.
+  *		KERN_RESOURCE_SHORTAGE	Couldn't allocate memory.
+  */
+-
+ kern_return_t
+-_kernelrpc_mach_ports_lookup3(
++mach_ports_lookup(
+ 	task_t                  task,
+-	ipc_port_t             *port1,
+-	ipc_port_t             *port2,
+-	ipc_port_t             *port3)
++	mach_port_array_t      *portsp,
++	mach_msg_type_number_t *portsCnt)
+ {
++	mach_port_array_t ports;
++
+ 	if (task == TASK_NULL) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
++	ports = mach_port_array_alloc(TASK_PORT_REGISTER_MAX,
++	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
++
+ 	itk_lock(task);
+ 	if (!task->ipc_active) {
+ 		itk_unlock(task);
++		mach_port_array_free(ports, TASK_PORT_REGISTER_MAX);
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
+-	*port1 = ipc_port_copy_send_any(task->itk_registered[0]);
+-	*port2 = ipc_port_copy_send_any(task->itk_registered[1]);
+-	*port3 = ipc_port_copy_send_any(task->itk_registered[2]);
++	for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++		ports[i].port = ipc_port_copy_send_any(task->itk_registered[i]);
++	}
+ 
+ 	itk_unlock(task);
+ 
++	*portsp = ports;
++	*portsCnt = TASK_PORT_REGISTER_MAX;
+ 	return KERN_SUCCESS;
+ }
+ 
+diff --git a/osfmk/mach/task.defs b/osfmk/mach/task.defs
+index f344980..c890a32 100644
+--- a/osfmk/mach/task.defs
++++ b/osfmk/mach/task.defs
+@@ -132,34 +132,26 @@ task_threads(
+  *	Stash a handful of ports for the target task; child
+  *	tasks inherit this stash at task_create time.
+  */
+-#if LIBSYSCALL_INTERFACE
++/*
++ * SWEET: the three-descriptor (port1/port2/port3) dialect introduced with
++ * xnu-10002 is not understood by the iOS 16 libsyscall, which sends and
++ * expects an out-of-line port array at this message ID.  Keep the older
++ * wire format unconditionally so 16.x userspace can register and look up
++ * the ports it inherits from launchd.  kern_exec() keeps calling
++ * _kernelrpc_mach_ports_register3() directly and is unaffected.
++ */
+ routine	mach_ports_register(
+ 		target_task	: task_t;
+ 		init_port_set	: mach_port_array_t =
+ 					^array[] of mach_port_t);
+-#else
+-routine	_kernelrpc_mach_ports_register3(
+-		target_task	: task_t;
+-		port1           : mach_port_t;
+-		port2           : mach_port_t;
+-		port3           : mach_port_t);
+-#endif
+ 
+ /*
+  *	Retrieve the stashed ports for the target task.
+  */
+-#if LIBSYSCALL_INTERFACE
+ routine	mach_ports_lookup(
+ 		target_task	: task_t;
+ 	out	init_port_set	: mach_port_array_t =
+ 					^array[] of mach_port_t);
+-#else
+-routine	_kernelrpc_mach_ports_lookup3(
+-		target_task	: task_t;
+-	out	port1		: mach_port_t;
+-	out	port2		: mach_port_t;
+-	out	port3		: mach_port_t);
+-#endif
+ 
+ /*
+  *      Returns information about the target task.

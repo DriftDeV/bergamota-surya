@@ -1,0 +1,50 @@
+From: goose-archives/Bergamota (derived from ry-diffusion/Bergamota)
+Subject: [PATCH] dump the first iOS 16 swap records and presentation counters (community patch 0257 from goose-archives/Bergamota develop, renumbered 0313)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1191,6 +1191,9 @@
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+ 		fStLogT = now;
+ 		IOLog("SWEET FB: stats %s", line);
++		IOLog("SWEET FB: q swaps=%llu empty=%llu kept=%llu copy=%llu zc=%llu holds=%llu hz=%u early=%d\n",
++		    c.swaps, c.emptySwaps, c.emptyKept, c.copy, c.zc, c.gpuHolds,
++		    fVsyncUS ? 1000000u / fVsyncUS : 0, fEarly ? 1 : 0);
+ 	}
+ 	fStPrev = fSt;
+ 	fStPrev.swaps = swaps;
+@@ -3551,7 +3554,33 @@
+ 			memcpy(raw, args->structureInput, nraw);
+ 		}
+ 		if (insz < SWEET_FB_SWAP_REC_18_SIZE) {
++			static uint32_t recDumps;
+ 			memcpy(rec, in, sizeof(rec));
++			if (recDumps < 2) {
++				recDumps++;
++				IOLog("SWEET FB: rec%u insz %u desc %d in %d id %u mask 0x%x mask2 0x%x ids %u %u %u %u valid %u %u %u %u\n",
++				    recDumps, insz, args->structureInputDescriptor != NULL,
++				    args->structureInput != NULL, get32(rec, 0x50), get32(rec, 0x104),
++				    get32(rec, 0x108), get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c),
++				    get32(rec, 0x60), get32(rec, 0xa4), get32(rec, 0xa8), get32(rec, 0xac),
++				    get32(rec, 0xb0));
++				for (uint32_t off = 0; off < SWEET_FB_SWAP_REC_SIZE; off += 32) {
++					IOLog("SWEET FB: rec+%03x %08x %08x %08x %08x %08x %08x %08x %08x\n", off,
++					    get32(rec, off + 0), get32(rec, off + 4), get32(rec, off + 8),
++					    get32(rec, off + 12), get32(rec, off + 16), get32(rec, off + 20),
++					    get32(rec, off + 24), get32(rec, off + 28));
++				}
++				IOLog("SWEET FB: rec alt id %u ids %u %u %u %u ra %d,%d %dx%d rb %d,%d %dx%d\n",
++				    get32(rec, 0x98), get32(rec, 0x9c), get32(rec, 0xa0), get32(rec, 0xa4),
++				    get32(rec, 0xa8), (int32_t)get32(rec, 0xac), (int32_t)get32(rec, 0xb0),
++				    (int32_t)get32(rec, 0xb4), (int32_t)get32(rec, 0xb8),
++				    (int32_t)get32(rec, 0x10c), (int32_t)get32(rec, 0x110),
++				    (int32_t)get32(rec, 0x114), (int32_t)get32(rec, 0x118));
++				IOLog("SWEET FB: rec rects a %d,%d %dx%d b %d,%d %dx%d\n",
++				    (int32_t)get32(rec, 0x64), (int32_t)get32(rec, 0x68), (int32_t)get32(rec, 0x6c),
++				    (int32_t)get32(rec, 0x70), (int32_t)get32(rec, 0xc4), (int32_t)get32(rec, 0xc8),
++				    (int32_t)get32(rec, 0xcc), (int32_t)get32(rec, 0xd0));
++			}
+ 			fFB->swap(rec);
+ 			break;
+ 		}
