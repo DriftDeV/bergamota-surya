@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|surya] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
 """
 import hashlib, os, struct, sys
 
@@ -46,6 +46,18 @@ BOARDS = {
         compat=['xiaomi,sweet', 'qcom,sm7150'],
         # 0-5 Cortex-A55, 6-7 Cortex-A76
         cpu_compat='qcom,kryo470', big_from=6, freqs=(1804800000, 2304000000)),
+    # Poco X3 NFC (M2007J20CG, SM7150): same SoC, same cont_splash (0x9c000000, 1080x2400 NT36672C)
+    # and RAM map as sweet (live FDT in dtb/surya/live.dts). 'xiaomi,sweet' stays: SweetPlatformExpert
+    # matches it. The synthetic Wi-Fi/BT MACs stop MobileGestalt waiting for an IONetworkController
+    # (see beryllium below). Touch is Novatek NVT on SPI here, not sweet's controller.
+    'surya': dict(
+        fb=(0x9c000000, 0x1700000), fb_wh=(1080, 2400),
+        compat=['xiaomi,surya', 'xiaomi,sweet', 'qcom,sm7150'],
+        cpu_compat='qcom,kryo470', big_from=6, freqs=(1804800000, 2304000000),
+        chosen_extra=[
+            ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe0, 0x02])),
+            ('mac-address-bluetooth0', bytes([0x02, 0x00, 0x5e, 0x77, 0xb0, 0x02])),
+        ]),
     'beryllium': dict(
         # cont_splash_mem@9d400000, simple-framebuffer 1080x2246 (mainline beryllium-common)
         fb=(0x9d400000, 0x2400000), fb_wh=(1080, 2246),
