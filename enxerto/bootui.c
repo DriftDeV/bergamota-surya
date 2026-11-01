@@ -38,6 +38,8 @@
 
 #ifdef BOARD_BERYLLIUM
 #define DEVICE_NAME	"POCO F1"
+#elif defined(BOARD_SURYA)
+#define DEVICE_NAME	"POCO X3 NFC"
 #else
 #define DEVICE_NAME	"REDMI NOTE 10 PRO"
 #endif

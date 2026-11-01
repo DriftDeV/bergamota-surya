@@ -12,6 +12,15 @@
 #define FB_H			2246
 /* sdm845 imem@146bf000, restart_reason@65c */
 #define IMEM_RESTART_REASON	0x146bf65cUL
+#elif defined(BOARD_SURYA)
+#define BOARD_NAME		"surya"
+/* Poco X3 NFC (SM7150): same values as sweet, read from its live FDT (dtb/surya/live.dts) */
+/* reserved-memory cont_splash_region@9c000000 (0x1700000), panel NT36672C 1080x2400 */
+#define FB_BASE			0x9c000000UL
+#define FB_W			1080
+#define FB_H			2400
+/* qcom,msm-imem@146aa000, restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146aa65cUL
 #else
 #define BOARD_NAME		"sweet"
 /* reserved-memory cont_splash_region@9c000000 */

@@ -7,7 +7,11 @@
 #include "sparse.h"
 
 #ifndef FB_PRODUCT
+#ifdef BOARD_SURYA
+#define FB_PRODUCT	"surya"
+#else
 #define FB_PRODUCT	"beryllium"
+#endif
 #endif
 #define FB_VERSION_BL	"bergamota-2"
 #define FB_SERIAL	"bergamota0001"
