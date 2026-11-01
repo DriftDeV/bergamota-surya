@@ -2,3 +2,4 @@ Patches for the iOS 16 userland on the xnu-11215 kernel (goose-archives/Bergamot
 0310 serves the pre-xnu-10002 out-of-line mach_ports_register/lookup ABI; with an iOS 18 root launchd dies with
 mach_ports_lookup() failed: -300 (boot 1, 2026-11-02).
 0311 accepts the iOS 16.5 0x46c IOMFB swap record.
+0313, 0314, 0316, 0317 edit SweetFramebuffer.cpp on top of 0311 (iOS 16.5 swap record) and were moved out with it. Series kept for iOS 18: 0312 and 0315 (USB live log).
