@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2083 @@
+@@ -0,0 +1,2084 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -496,6 +496,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#include <kern/sched_prim.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
 +#include <arm/caches_internal.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
@@ -2523,7 +2524,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_scm.c
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,357 @@
 +/*
 + * SWEET: Qualcomm SCM availability queries, opt-in with sweetscm=1.
 + *
@@ -2544,6 +2545,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#include <pexpert/device_tree.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
 +#include <arm/caches_internal.h>
 +#include "sweet_rpmh.h"
 +
