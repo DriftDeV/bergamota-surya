@@ -1,0 +1,102 @@
+From: surya port <local>
+Subject: [PATCH] iOS 16 userland on the iOS 18-aware series: accept the 0x46c swap record, boot-arg sweetios16=1 selects the iOS 16 IOSurface lock result
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1791,6 +1791,13 @@
+ 		 * Without this every swap looked empty (mask 0): backboardd presented 5000 frames and the panel stayed black.
+ 		 */
+ 		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (args->structureInputDescriptor == NULL && args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE &&
++		    args->structureInputSize < 0x514) {
++			/* iOS 16 IOMobileFramebuffer: the 0x46c record this driver was written for, used as is */
++			memcpy(rec, in, sizeof(rec));
++			fFB->swap(rec);
++			break;
++		}
+ 		if (args->structureInputDescriptor != NULL || args->structureInputSize < 0x514) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -76,6 +76,7 @@
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xc68   /* iOS 18: 0x88 header + 20 planes * 0x98 */
++#define SWEET_SURFACE_RESULT_SIZE_16    0xa68   /* iOS 16: 0x68 header + 20 planes * 0x80 (boot-arg sweetios16=1) */
+ #define SWEET_SURFACE_MAX_ID            4096
+ #define SWEET_SURFACE_MAX_DIM           16384
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+@@ -915,10 +916,63 @@
+  * The iOS 16 layout put 32-bit fields at 0x1c.., so the client read width/height/rowbytes as garbage and CoreUI wrote
+  * past the surface (SpringBoard SIGSEGV in vImageDeepmap2Decode, destination = base + bytesPerElement).
+  */
++/* boot-arg sweetios16=1: the userland is iOS 16 (patch 0223): its lock result and swap record use the older layouts */
++static bool
++sweet_surf_ios16(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		int v = 0;
++		(void)PE_parse_boot_argn("sweetios16", &v, sizeof(v));
++		cached = v != 0;
++	}
++	return cached == 1;
++}
++
++static uint32_t
++sweet_surf_result_size(void)
++{
++	return sweet_surf_ios16() ? SWEET_SURFACE_RESULT_SIZE_16 : SWEET_SURFACE_RESULT_SIZE;
++}
++
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
++	if (sweet_surf_ios16()) {
++		/* iOS 16 layout (the one before patch 0159) */
++		put64(out, 0x00, ref->data->getAddress() + s->wrapDelta);
++		put64(out, 0x08, ref->state->getAddress());
++		put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
++		put32(out, 0x18, s->id);
++		put32(out, 0x1c, s->allocSize);
++		put32(out, 0x20, s->width);
++		put32(out, 0x24, s->height);
++		put32(out, 0x28, s->bytesPerRow);
++		put32(out, 0x2c, s->offset);
++		put32(out, 0x30, s->pixelFormat);
++		put32(out, 0x34, s->allocSize);
++		put32(out, 0x38, s->planeCount);
++		memcpy(out + 0x40, &s->bytesPerElement, 2);
++		out[0x42] = s->elementWidth;
++		out[0x43] = s->elementHeight;
++		put32(out, 0x44, s->cacheMode);
++		put32(out, 0x50, s->parentID);
++		put32(out, 0x54, 1);
++		for (uint32_t i = 0; i < s->planeCount && i < 20; i++) {
++			uint8_t *p = out + 0x68 + i * 0x80;
++			const struct sweet_surface_plane *pl = &s->planes[i];
++			put32(p, 0x00, pl->width);
++			put32(p, 0x04, pl->height);
++			put32(p, 0x08, pl->bytesPerRow);
++			put32(p, 0x0c, pl->offset);
++			put32(p, 0x14, pl->size);
++			memcpy(p + 0x18, &pl->bytesPerElement, 2);
++			p[0x1a] = pl->elementWidth;
++			p[0x1b] = pl->elementHeight;
++		}
++		return;
++	}
+ 	put64(out, 0x00, ref->data->getAddress() + s->wrapDelta);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+@@ -987,7 +1041,7 @@
+ 		if (existing) {
+ 			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
+ 		}
+-		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
++		ret = sweet_struct_out(args, out, sweet_surf_result_size());
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+ 	}
+ 	if (ret != kIOReturnSuccess && !existing) {
