@@ -63,6 +63,33 @@ Qualcomm ABL (stock, unlocked)
 | Working on | GPU acceleration on the Adreno 630 (OpenGL ES over Mesa freedreno, then Metal) |
 | Not working | Wi-Fi, cellular, Bluetooth, audio, camera, sensors, SEP / Face ID, GPU acceleration |
 
+## Poco X3 NFC (`surya`, SM7150): work in progress
+
+The same project, second phone: the Poco X3 NFC (M2007J20CG, Snapdragon 732G). Work is on the `surya` branch of [DriftDeV/bergamota-surya](https://github.com/DriftDeV/bergamota-surya). Everything below was tested on the phone with `fastboot boot` only (the bootloader and every other partition stay untouched); only `userdata` is flashed with the iOS root. Details and every log: [`NOTES.md`](NOTES.md), [`PORT_SURYA.md`](PORT_SURYA.md).
+
+| Area | State on surya |
+| --- | --- |
+| Bootloader | Enxerto builds with `BOARD=surya` (same framebuffer 0x9c000000, 1080×2400 and IMEM restart reason as sweet; boot.img v2 like the stock ROM) and shows the Bergamota fastboot screen |
+| iOS | **iOS 16.7.16** (xnu-8796, iPhone X userland) to the home screen: SpringBoard, Settings, Photos, Safari; SSH at `root@192.168.7.2`. iOS 18 (this branch's `patches-11215`) and 26 are next, built on GitHub Actions |
+| Touch | Novatek **NT36672C on SPI**: software SPI on gpio49-52, firmware downloaded at every boot from the ADT (`tools/adt-touchfw.py`; the blob is Novatek's and stays out of git). Patches `0222` / `0300` |
+| Buttons, battery, USB | Power/volume keys over SPMI, battery state and CDC-ECM Ethernet work |
+| GPU | Adreno 618: GMU boots (`0xBABEFACE`), HFI up, GX rail on, the signed `a615_zap` is authenticated by TrustZone. The CP does not execute commands yet (patches `0224`, `0225` / `0301`) |
+| Not working | GPU acceleration, audio, Wi-Fi, cellular, Bluetooth, camera, sensors |
+
+Rough recipe (from a Mac with Xcode, `dtc`, `aarch64-elf-gcc`, `mkbootimg`; the kernel of the iOS 16 line can only be built locally now that GitHub retires its macOS 14 runners):
+
+```sh
+# backup first (see NOTES.md), then read the live device tree and the stock boot.img header from OrangeFox
+BOARD=surya CHARGER=0 enxerto/build.sh                      # Enxerto + Bergamota fastboot image
+python3 tools/mkadt.py out.adt --board surya --highmem --display-scale 2
+python3 tools/adt-touchfw.py out.adt out-touch.adt novatek_ts_huaxing_fw.bin   # from /vendor/firmware
+python3 tools/adt-gpufw.py out-touch.adt out-gpu.adt --fw FWDIR --zap ZAPDIR    # a618_gmu.bin, a630_sqe.fw, a615_zap (renamed a630_*)
+python3 tools/mkpayload.py kernel.development.sweet out-gpu.adt payload.bin --compress --cmdline '... sweetios16=1'
+BOARD=surya CHARGER=0 enxerto/build.sh payload.bin && fastboot boot enxerto/out/enxerto-boot.img
+```
+
+Every boot is `fastboot boot` from RAM; a power cycle returns to the stock boot chain, and Android's data is gone once `userdata` holds the iOS root (OrangeFox: Wipe, Format Data brings Android back).
+
 ## Getting started
 
 You need a Mac (the Renegade root step also runs on Linux, see 3b), a Poco F1 with an **unlocked bootloader**, and a backup of its partitions (see [`NOTES.md`](NOTES.md)).
@@ -235,6 +262,8 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | `tools/bergamota-flash.py` | Delta/full flashing of userdata, boot and logo through Bergamota fastboot |
 | `tools/extract-dtb.py` | Extracts the stock DTBs from a boot.img (also the Poco F1's appended Image.gz-dtb) and picks yours |
 | `tools/mkadt.py`, `mkpayload.py` | Apple Device Tree generator; kernel + ADT + boot-args payload packer |
+| `xnu/patches/0222-0225`, `xnu/patches-11215/0300-0301` | The Poco X3 NFC (surya): Novatek SPI touch, the iOS 16 IOMFB/IOSurface layouts, the Adreno 618 bring-up and signed zap load |
+| `tools/adt-touchfw.py` | Novatek touch firmware into the ADT (`/sweet-touch`) |
 | `tools/sweetnet/` | Small on-device tools (`sweetps`, `sweetprefs`, `sweetuicache`, …) |
 | `tools/identity/` | The Bergamota identity (Newton halftone, lime ground, Archivo + JetBrains Mono): `mkidentity.py` generates Enxerto's `art.h` and the kernel console's portrait, `mkicon.sh` the app icon |
 | `tools/mksplash.py` | The ABL screens of the `logo` partition, from Enxerto's own renders |
@@ -244,5 +273,7 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 Not in git: partition backups, device trees, Apple firmware and root images, or anything with serial numbers or calibration data.
 
 ## Credits
+
+Poco X3 NFC port: the Novatek protocol follows Xiaomi's `nt36xxx_spi` driver (GPL) from the surya kernel source; the Adreno 618 bring-up is based on the `gpu` branch of [mxtpasontop/ios-sweet](https://github.com/mxtpasontop/ios-sweet) (no licence file published). Firmware blobs (Novatek, Qualcomm) are never committed.
 
 This started as a fork of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro). The iOS 16 days of this port are in [`docs/IOS16_README.md`](docs/IOS16_README.md). It is built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw), the Linux kernel's SDM845 drivers for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
