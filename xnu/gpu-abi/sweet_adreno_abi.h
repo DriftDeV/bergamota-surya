@@ -25,6 +25,15 @@
 #define SWEET_GPU_SERVICE_NAME          "SweetAdreno630"
 #define SWEET_GPU_ABI_VERSION           1
 
+/* Poco X3 NFC (surya, SM7150, Adreno 618): same selectors and structures (SWEET_GPU_ABI_VERSION 1), published by a
+ * separate IOService/user client pair (iokit/Kernel/arm/SweetAdreno618.cpp, patch 0320, only with boot-arg sweetgpu=11).
+ * Registry properties of the service: SweetGPUABIVersion = SWEET_GPU_ABI_VERSION, SweetGPUChipID = SWEET_GPU_CHIP_ID_A618.
+ * Differences: INFO answers gpu_id 618, chip_id SWEET_GPU_CHIP_ID_A618 and abi_minor 0 (no SURFACE_BO and no DEBUG:
+ * both answer kIOReturnUnsupported, no SWEET_GPU_INFO_CAP_SBO_ALIAS). See docs/SURYA_GPU_IOKIT.md. */
+#define SWEET_GPU_SERVICE_NAME_A618     "SweetAdreno618"
+#define SWEET_GPU_ID_A618               618
+#define SWEET_GPU_CHIP_ID_A618          0x06010800
+
 /* Selectors of IOConnectCallStructMethod. */
 enum sweet_gpu_selector {
 	SWEET_GPU_SEL_GEM_CLOSE         = 0x09, /* DRM_IOCTL_GEM_CLOSE:        struct sweet_gem_close */
