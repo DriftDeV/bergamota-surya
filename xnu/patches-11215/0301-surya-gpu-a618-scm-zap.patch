@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2084 @@
+@@ -0,0 +1,2122 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -1783,6 +1783,44 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	/* a618 thresholds and pool size from the phone driver; no UCHE/rendering
 +	 * setup or protected/security register access in this stage.
 +	 */
++	/*
++	 * Write probe (diagnostic, boot 2026-11-02): the CP register file ignored the
++	 * first write. Write the non-CP registers the working A630 bring-up (0103
++	 * gpu_cp_hw_init) writes first, in its order, read each back and carry on, to
++	 * see whether the whole GPU register space ignores writes or only the CP block.
++	 * Every value is a Linux a6xx_hw_init value; none starts the CP or touches the
++	 * secure (SECVID) registers.
++	 */
++	{
++		const struct { const char *name; uint32_t reg, value; } probe[] = {
++			{ "CP_ADDR_MODE_CNTL",       0x842,  1 },
++			{ "VSC_ADDR_MODE_CNTL",      0xc01,  1 },
++			{ "GRAS_ADDR_MODE_CNTL",     0x8601, 1 },
++			{ "RB_ADDR_MODE_CNTL",       0x8e05, 1 },
++			{ "UCHE_ADDR_MODE_CNTL",     0xe00,  1 },
++			{ "RBBM_CLIENT_QOS_CNTL",    0x3da,  3 },
++			{ "RBBM_PERFCTR_BUSY_MASK",  0x50b,  0xffffffffu },
++			{ "UCHE_WRITE_THRU_BASE",    0xe07,  0xfffff000u },
++			{ "UCHE_GMEM_RANGE_MIN",     0xe0b,  0x100000 },
++			{ "UCHE_FILTER_CNTL",        0xe18,  0x804 },
++			{ "UCHE_CACHE_WAYS",         0xe17,  0x4 },
++			{ "PC_DBG_ECO_CNTL",         0x9e00, 0x00180000 },
++			{ "RBBM_INTF_HANG_INT_CNTL", 0x1f,   (1u << 30) | 0x1fffff },
++		};
++		unsigned stuck = 0;
++		for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); ++i) {
++			uint32_t was = gpu_rd(gpu, probe[i].reg * 4);
++			gpu_wr(gpu, probe[i].reg * 4, probe[i].value);
++			uint32_t got = gpu_rd(gpu, probe[i].reg * 4);
++			printf("SWEET GPU: probe %-24s reg=%#x was=%#x wrote=%#x read=%#x %s\n", probe[i].name,
++			    probe[i].reg, was, probe[i].value, got, got == probe[i].value ? "STICKS" : "IGNORED");
++			sweet_log_sync();
++			stuck += got == probe[i].value;
++		}
++		printf("SWEET GPU: probe: %u of %zu writes stuck; AHB fence status=%#x\n", stuck,
++		    sizeof(probe) / sizeof(probe[0]), gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
++		sweet_log_sync();
++	}
 +	const struct { uint32_t reg, value; } setup[] = {
 +		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0 },
 +		{ A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c },
