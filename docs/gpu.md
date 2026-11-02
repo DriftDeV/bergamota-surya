@@ -206,3 +206,20 @@ Fonti: ricerca sul riuso di Snapintosh fornita dall'utente (solo fatti e metodo,
 **Da non importare per errore da a8xx:** `CP_ME_INIT` a 7 dword, `CP_THREAD_CONTROL`, BR/BV, offset `A8XX_*`, tabelle protect x285. Su A618 vale `a630_protect`, un solo ring, zap `a615_zap.mbn`.
 
 **Idee riusabili più avanti (passi B-D, solo concetto):** disciplina di lifetime delle mappe (reserve, bind, pin, insert, unwire), resource list e latch fail-fast per il kext; front end AIR→NIR di air2ir3 (MIT, da verificare quanto sia legato al chip); copia CPU in framebuffer per i primi pixel indipendentemente dal CP. UniXNU `NativeAdreno` (BSD-2-Clause-Patent) è un template più pulito del kext Snapintosh.
+
+## 5.3 postmarketOS / sm7150-mainline: la GPU di questo telefono funziona su Linux mainline (2026-11-02)
+
+Fonti lette: wiki postmarketOS "Xiaomi POCO X3 NFC (xiaomi-surya)" e "Qualcomm SM7150 (qcom-sm7150)", repository `github.com/sm7150-mainline/linux` (branch `v7.2`, aggiornato 2026-06-27: `sm7150.dtsi`, `sm7150-xiaomi-surya.dtsi`, commit sul driver adreno), pacchetto `firmware-qcom-sm7150` di pmaports. Solo fatti e confronti: nessun codice copiato (devicetree e kernel sono GPL/BSD, qui si citano indirizzi e nomi).
+
+**Fatti**
+- Il wiki segnala per il Poco X3 NFC: accelerazione 3D "Works", touch, display, Wi-Fi e Bluetooth "Works", audio "Partial", fotocamere "Broken", fingerprint "Broken". La GPU di questo telefono è quindi pilotabile con il driver Linux standard (`msm` + `a6xx`) e il firmware `a615_zap.mbn` di Xiaomi.
+- L'unica modifica al driver per la a618 su SM7150 è un commit "HACK" che aggiunge `.revn = 618` alla voce `qcom,sm7150` del catalogo (chip id `0x06010800`, famiglia `ADRENO_6XX_GEN1`, firmware `a630_sqe.fw` e `a630_gmu.bin`). Niente sequenza di accensione specifica del SoC: è il flusso a6xx normale (`a6xx_hw_init`), lo stesso che abbiamo confrontato con la ricerca del 2026-11-02.
+- Devicetree (`sm7150.dtsi`): GPU `0x05000000` (0x40000), `cx_mem` `0x0509e000`, `cx_dbgc` `0x05061000`; SMMU `0x05040000`, `#global-interrupts = 2`; GMU `0x0506a000` (0x31000), PDC `0x0b290000`, PDC seq `0x0b490000`. **Tutti coincidono con le costanti del patch 0301.** Stream ID: GPU `<&adreno_smmu 0 0x0>`, GMU `<&adreno_smmu 5>`: coincidono con CP SID 0 e `GMU_SID_KERNEL 5` del patch.
+- Zap: `gpu_mem: gpu@97715000 { reg = <0x0 0x97715000 0x0 0x2000>; no-map; }` e `firmware-name = "qcom/sm7150/xiaomi/surya/a615_zap.mbn"`. È una regione **riservata e fissa** di 8 KiB.
+- Il firmware ath10k, audio (WCD937x) e SoC sono nello stesso albero: utili per le fasi Wi-Fi e audio (`docs/wifi.md`, `docs/audio.md`).
+
+**Differenza con il nostro patch 0301** (da verificare, non è una causa dimostrata)
+- Noi allochiamo il codice dello zap in 1 MiB di RAM qualsiasi, allineato a 1 MiB (`ZAP_ALLOC_SIZE 0x100000`), e passiamo a TrustZone `MEM_SETUP(pa, 0x1000)`. Linux e Android lo caricano nella regione riservata `0x97715000`. Non sappiamo se TrustZone protegga correttamente un indirizzo arbitrario. Indizi a favore del dubbio: `RBBM_SECVID_TRUST_CNTL` legge 1 dopo `CP_SET_SECURE_MODE 0` e 3 dopo `CP_MEM_WRITE`; `CP_IRQ 0x80` compare dopo `CP_MEM_WRITE`; il telefono si resetta senza panic dopo i test. Se l'SQE o il CP restano in uno stato trusted, una scrittura verso memoria non secure potrebbe causare una violazione XPU (ipotesi).
+- Esperimento proposto (Run D): caricare lo zap nella regione fissa `0x97715000` (mappata dal kernel come memoria I/O non cacheable, non allocata dal pool), mantenendo il resto uguale. Va controllato prima che quella regione sia riservata e non mappata nel nostro ADT.
+
+**Prossime letture utili:** `a6xx_gpu.c` e `a6xx_gmu.c` di `sm7150-mainline/linux` (differenze rispetto a upstream), il pacchetto `firmware-xiaomi-surya` (da dove viene `a615_zap.mbn`), la parte audio e touch del devicetree.
