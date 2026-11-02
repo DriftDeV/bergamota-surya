@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetAdreno618.cpp b/iokit/Kernel/arm/SweetAdreno6
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno618.cpp
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,893 @@
 +/*
 + * SweetAdreno618: IOKit service and user client for the Adreno 618 of the Poco X3 NFC (surya, SM7150).
 + *
@@ -620,6 +620,13 @@ new file mode 100644
 +			at += c->nr_relocs;
 +			ib[i] = cb->iova + c->submit_offset;
 +			ibn[i] = c->size / 4;
++			/* diagnostic (2026-11-02, userland test): what the kernel alias of the BO holds at submit time */
++			{
++				const volatile uint32_t *w = (const volatile uint32_t *)(cb->kva + c->submit_offset);
++				const volatile uint32_t *bo = (const volatile uint32_t *)cb->kva;
++				IOLog("SWEET GPU: submit cmd %u: iova %#llx dwords %u first %08x %08x %08x %08x %08x %08x last %08x; BO+0 %08x %08x BO+0x400 %08x %08x BO+0x800 %08x BO+0xc00 %08x\n",
++				    i, ib[i], ibn[i], w[0], w[1], w[2], w[3], w[4], w[5], w[ibn[i] - 1], bo[0], bo[1], bo[0x100], bo[0x101], bo[0x200], bo[0x300]);
++			}
 +		}
 +		__asm__ volatile ("dsb sy" ::: "memory");       /* the patched dwords reach memory before the CP reads them */
 +	}

@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3393 @@
+@@ -0,0 +1,3403 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -3220,6 +3220,16 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	uint32_t done = cp_memory ? *(volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE) : 0;
 +
 +	printf("SWEET GPU: %s: submitted %u, completed %u, ring WPTR %u\n", why, a618_dev.seqno, done, cp_ring_wptr);
++	if (cp_memory) {
++		/* the last submission: 2 CCU events (4 dwords), CP_INDIRECT_BUFFER (4) and the fence event (5) */
++		const volatile uint32_t *rg = (const volatile uint32_t *)(cp_memory + CP_RING_OFF);
++		const unsigned rn = CP_RING_BYTES / 4, rw = cp_ring_wptr;
++#define A618_RG(k) rg[(rw + rn - (k)) % rn]
++		printf("SWEET GPU: %s: last ring dwords %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", why,
++		    A618_RG(13), A618_RG(12), A618_RG(11), A618_RG(10), A618_RG(9), A618_RG(8), A618_RG(7), A618_RG(6), A618_RG(5),
++		    A618_RG(4), A618_RG(3), A618_RG(2), A618_RG(1));
++#undef A618_RG
++	}
 +	if (a618_regs_safe()) {
 +		printf("SWEET GPU: %s: ring RPTR %u RBBM_STATUS %#x CP_STATUS_1 %#x HW_FAULT %#x CP_IRQ %#x PROTECT %#x RBBM_IRQ %#x\n",
 +		    why, gpu_rd(a618_gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(a618_gpu, A6XX_RBBM_STATUS * 4),
