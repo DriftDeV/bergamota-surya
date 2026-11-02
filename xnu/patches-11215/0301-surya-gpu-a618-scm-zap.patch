@@ -2810,7 +2810,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_scm.c
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,397 @@
 +/*
 + * SWEET: Qualcomm SCM availability queries, opt-in with sweetscm=1.
 + *
@@ -2959,6 +2959,8 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +static bool scm_zap_ready, scm_zap_attempted;
 +#define ZAP_ALLOC_SIZE 0x100000u
 +#define ZAP_LOGICAL_SIZE 0x1000u
++#define ZAP_FIXED_PA 0x97715000u        /* DT sm7150.dtsi gpu_mem: gpu@97715000, no-map, 0x2000 (Run D) */
++#define ZAP_FIXED_SIZE 0x2000u
 +
 +/* ELF32 little endian, byte accesses also accept an unaligned ADT property. */
 +static uint32_t
@@ -3040,17 +3042,24 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +		printf("SWEET SCM: missing or unsupported a615_zap metadata/code\n");
 +		return true;
 +	}
-+	/* One aligned, owned MiB for the protected image; metadata in a separate page. */
-+	vm_offset_t kva;
-+	const vm_size_t bytes = ZAP_ALLOC_SIZE + PAGE_SIZE;
-+	if (kmem_alloc_contig(kernel_map, &kva, bytes, ZAP_ALLOC_SIZE - 1, 0, (ZAP_ALLOC_SIZE >> PAGE_SHIFT) - 1,
++	/* Run D (sweetzapfixed=1): the image goes into the firmware's reserved gpu_mem carve-out, as Linux does;
++	 * the metadata always lives in owned kernel pages. Default: one aligned, owned MiB for both. */
++	int fixed = 0;
++	PE_parse_boot_argn("sweetzapfixed", &fixed, sizeof(fixed));
++	vm_offset_t kva = 0, md_kva;
++	uint64_t pa, md_pa;
++	volatile uint32_t *fixed_img = NULL;
++	const vm_size_t md_bytes = round_page(mdt_size);
++	const vm_size_t bytes = fixed ? md_bytes : ZAP_ALLOC_SIZE + PAGE_SIZE;
++	if (kmem_alloc_contig(kernel_map, &kva, bytes, fixed ? PAGE_MASK : ZAP_ALLOC_SIZE - 1, 0,
++	    fixed ? 0 : (ZAP_ALLOC_SIZE >> PAGE_SHIFT) - 1,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		printf("SWEET SCM: zap contiguous allocation failed\n");
 +		return true;
 +	}
 +	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
-+	uint64_t pa = ptoa_64(pn);
-+	if (!pn || (pa & (ZAP_ALLOC_SIZE - 1))) {
++	uint64_t apa = ptoa_64(pn);
++	if (!pn || (!fixed && (apa & (ZAP_ALLOC_SIZE - 1)))) {
 +		printf("SWEET SCM: zap invalid allocation PA/alignment\n");
 +		return true;
 +	}
@@ -3063,18 +3072,44 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	for (unsigned i = 0; i < bytes / PAGE_SIZE; ++i) {
 +		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
 +	}
-+	flush_dcache64((addr64_t)pa, bytes, TRUE);
-+	memcpy((void *)(kva + ZAP_ALLOC_SIZE), mdt, mdt_size);
-+	printf("SWEET SCM: zap owned image=%#llx allocation=%#x logical=%#x metadata=%#llx/%u code=%u\n",
-+	    pa, ZAP_ALLOC_SIZE, ZAP_LOGICAL_SIZE, pa + ZAP_ALLOC_SIZE, mdt_size, code_size);
++	flush_dcache64((addr64_t)apa, bytes, TRUE);
++	if (fixed) {
++		pa = ZAP_FIXED_PA;
++		md_kva = kva;
++		md_pa = apa;
++		fixed_img = (volatile uint32_t *)ml_io_map(pa, ZAP_FIXED_SIZE);
++		if (!fixed_img) {
++			printf("SWEET SCM: zap fixed region %#llx not mappable\n", pa);
++			return true;
++		}
++		for (unsigned i = 0; i < ZAP_FIXED_SIZE / 4; ++i) {
++			fixed_img[i] = 0;
++		}
++	} else {
++		pa = apa;
++		md_kva = kva + ZAP_ALLOC_SIZE;
++		md_pa = apa + ZAP_ALLOC_SIZE;
++	}
++	memcpy((void *)md_kva, mdt, mdt_size);
++	printf("SWEET SCM: zap owned image=%#llx (%s) allocation=%#x logical=%#x metadata=%#llx/%u code=%u\n",
++	    pa, fixed ? "fixed gpu_mem carve-out" : "kernel RAM", fixed ? ZAP_FIXED_SIZE : ZAP_ALLOC_SIZE, ZAP_LOGICAL_SIZE,
++	    md_pa, mdt_size, code_size);
 +	/* SCM_ARGS(2, VAL, RW) = 2 | (2 << 6) = 0x82. Monitor verifies signatures. */
-+	enum zap_result result = zap_call("INIT_IMAGE", 1, 0x82, pa + ZAP_ALLOC_SIZE, 0);
++	enum zap_result result = zap_call("INIT_IMAGE", 1, 0x82, md_pa, 0);
 +	if (result != ZAP_OK) {
 +		return result == ZAP_ERROR;
 +	}
 +	result = zap_call("MEM_SETUP", 2, 3, pa, ZAP_LOGICAL_SIZE);
 +	if (result == ZAP_OK) {
-+		memcpy((void *)kva, code, code_size);
++		if (fixed) {
++			for (unsigned i = 0; i < code_size / 4; ++i) {
++				fixed_img[i] = ((const uint32_t *)(const void *)code)[i];
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("SWEET SCM: zap code written to %#llx, first words %08x %08x\n", pa, fixed_img[0], fixed_img[1]);
++		} else {
++			memcpy((void *)kva, code, code_size);
++		}
 +		result = zap_call("AUTH_AND_RESET", 5, 1, 0, 0);
 +		if (result == ZAP_OK) {
 +			printf("SWEET SCM: signed zap authenticated and started\n");
