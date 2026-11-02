@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3403 @@
+@@ -0,0 +1,3413 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -2871,6 +2871,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#define A618_MAX_IBS            128
 +#define A618_PC_CCU_INVALIDATE_DEPTH 24         /* pm4.xml.h event types, as Linux a6xx_submit */
 +#define A618_PC_CCU_INVALIDATE_COLOR 25
++#define A618_CACHE_INVALIDATE        49         /* pm4.xml.h CACHE_INVALIDATE: GPU-side cache (UCHE) invalidate before each submit */
 +#define A618_SMMU_FAULT_BITS    0xc00001feu     /* CB FSR fault bits; bit 10 reads 0x400 from boot on and is ignored */
 +#define A618_CHIP_ID            0x06010800u
 +#define GMU_AO_COUNTER_L        GMU_REG(0x1f888)        /* GMU always-on counter, 19.2 MHz (a6xx_gmu.xml 0x5088 + 0x1a800) */
@@ -3087,12 +3088,19 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	return false;
 +}
 +
-+/* Give a range back, coalescing; a full list drops the range (address space is lost, never corrupted). */
++/* Give a range back, coalescing; a full list drops the range (address space is lost, never corrupted).
++ * 2026-11-02: ranges are NOT recycled by default. The first userland test faulted on the iova of an already freed
++ * selftest buffer (stale GPU cache or descriptor state for a reused VA with different contents). Never reusing a VA
++ * removes that class of problem; the 2 GiB window is ample for bring-up. Set a618_recycle_va to restore recycling. */
++static bool a618_recycle_va;
 +void
 +sweet_a618_iova_free(uint64_t iova, uint64_t size)
 +{
 +	unsigned i = 0;
 +
++	if (!a618_recycle_va) {
++		return;
++	}
 +	if (size == 0 || iova < A618_GVM_BASE || size > A618_GVM_END - A618_GVM_BASE || iova > A618_GVM_END - size) {
 +		return;
 +	}
@@ -3292,7 +3300,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +uint32_t
 +sweet_a618_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
 +{
-+	unsigned need = 16 + 4 * count, room = 0;
++	unsigned need = 18 + 4 * count, room = 0;
 +
 +	if (!sweet_a618_ready() || !ib_iova || !ib_dwords || count == 0 || count > A618_MAX_IBS) {
 +		return 0;
@@ -3335,6 +3343,8 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	cp_ring_emit(A618_PC_CCU_INVALIDATE_DEPTH);
 +	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
 +	cp_ring_emit(A618_PC_CCU_INVALIDATE_COLOR);
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
++	cp_ring_emit(A618_CACHE_INVALIDATE);
 +	for (unsigned i = 0; i < count; i++) {
 +		cp_ring_emit(cp_pkt7(CP_INDIRECT_BUFFER, 3));
 +		cp_ring_emit((uint32_t)ib_iova[i]);
