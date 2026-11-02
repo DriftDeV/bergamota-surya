@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2653 @@
+@@ -0,0 +1,3393 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -487,6 +487,12 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 + *               readback and software walks only (DT disables ATOS).
 + *   sweetgpu=9  8 plus cold CP ring/SQE register setup before the PAS test;
 + *               SQE control stays at initial zero; no commands submitted.
++ *   sweetgpu=10 9 plus SQE start, CP_ME_INIT and the CP tests (NOP, IB, first shader dispatch); with
++ *               sweetgpukeep=1 the GPU stays up for 6 rounds and is then shut down.
++ *   sweetgpu=11 10, but the GPU stays up for good (zap, SQE, OOB_GPU held, no shutdown thread) and the
++ *               kernel-internal API sweet_a618_* (GPU address space, submit, fences, ready hook) is
++ *               enabled, with an in-kernel API self-test (docs/SURYA_GPU_KERNEL_API.md).
++ *               Default off: every other value behaves exactly as before.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -2552,12 +2558,12 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +static bool gpu_kept;
 +
 +static bool
-+gpu_gx_test(bool zap, bool cp, bool run)
++gpu_gx_test(bool zap, bool cp, bool run, bool perm)
 +{
 +	uint32_t gx_gdscr;
 +	int keep = 0;
 +	PE_parse_boot_argn("sweetgpukeep", &keep, sizeof(keep));
-+	sweet_scm_zap_keep = keep != 0 && run && cp;
++	sweet_scm_zap_keep = (keep != 0 || perm) && run && cp;   /* sweetgpu=11: always kept (perm) */
 +
 +	if (gmu_oob_set(OOB_GPU, "gpu")) {
 +		(void)gpu_report(&gx_gdscr);
@@ -2838,6 +2844,736 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +}
 +
 +
++/* ------------------------------------------------------------------ */
++/* sweetgpu=11: permanent GPU core and the kernel-internal API         */
++/* ------------------------------------------------------------------ */
++
++/*
++ * boot-arg sweetgpu=11 runs every stage of sweetgpu=10 (GMU, HFI, GX on, signed zap, SQE, CP_ME_INIT,
++ * CP_SET_SECURE_MODE 0) and then keeps the GPU up for good: no shutdown thread, GX held on through OOB_GPU, the zap
++ * left running. The kernel-internal API sweet_a618_* (docs/SURYA_GPU_KERNEL_API.md) is then usable. Same shape as the
++ * Poco F1 sweet_gpu_* interface (sweet_a630.c): the kernel owns the GPU address space (context bank 1, ASID 2) and the
++ * ring, clients only ask. The caller serializes every call (one lock in the IOKit layer); nothing here locks.
++ * Without sweetgpu=11 none of this code runs.
++ *
++ * Client address space: [A618_GVM_BASE, A618_GVM_END) of context bank 1, 4 KiB GPU pages (xnu's PAGE_SIZE is 16 KiB:
++ * one PTE per 4 KiB, never PAGE_SIZE), L1 entries 2 and 3 of the static L1 table of gpu_cp_memory_setup, L2/L3 tables
++ * taken on demand from a pool of normal non-cacheable pages so the SMMU walker sees what the CPU wrote.
++ */
++#define A618_GVM_BASE           0x80000000ull
++#define A618_GVM_END            0x100000000ull
++#define A618_GVM_GUARD          0x1000ull       /* unmapped page after every kernel-placed buffer */
++#define A618_GVM_MAXFREE        4096
++#define A618_PTP_TABLE          0x1000ull       /* a GPU table is 4 KiB */
++#define A618_PTP_PAGES          1028            /* 4 MiB: 2 L2 + 1024 L3 (2 MiB each) + 2 spare; a whole number of 16 KiB pages */
++#define A618_PTP_PAGES_MIN      260             /* fallback: 2 L2 + 256 L3 (512 MiB of address space), 65 xnu pages */
++#define A618_SCRATCH_FENCE      0x200u          /* scratch page offset: last completed sequence number (CACHE_FLUSH_TS target) */
++#define A618_MAX_IBS            128
++#define A618_PC_CCU_INVALIDATE_DEPTH 24         /* pm4.xml.h event types, as Linux a6xx_submit */
++#define A618_PC_CCU_INVALIDATE_COLOR 25
++#define A618_SMMU_FAULT_BITS    0xc00001feu     /* CB FSR fault bits; bit 10 reads 0x400 from boot on and is ignored */
++#define A618_CHIP_ID            0x06010800u
++#define GMU_AO_COUNTER_L        GMU_REG(0x1f888)        /* GMU always-on counter, 19.2 MHz (a6xx_gmu.xml 0x5088 + 0x1a800) */
++#define GMU_AO_COUNTER_H        GMU_REG(0x1f889)
++
++/* The 13 API functions, the hook and its race-free setter (declared first: no missing prototypes). */
++bool sweet_a618_ready(void);
++bool sweet_a618_param(uint32_t which, uint64_t *value);
++bool sweet_a618_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken);
++bool sweet_a618_iova_reserve(uint64_t iova, uint64_t size);
++void sweet_a618_iova_free(uint64_t iova, uint64_t size);
++bool sweet_a618_vm_map(uint64_t iova, uint64_t pa, bool readonly);
++void sweet_a618_vm_unmap(uint64_t iova, uint64_t size);
++void sweet_a618_cache_sync(void *va, size_t len);
++uint32_t sweet_a618_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
++bool sweet_a618_fence_done(uint32_t fence);
++uint32_t sweet_a618_fence_last(void);
++void sweet_a618_mark_lost(void);
++void sweet_a618_report(const char *why);
++extern void (*sweet_a618_ready_hook)(void);
++void sweet_a618_set_ready_hook(void (*hook)(void));
++
++/* Called once, from the self-test thread, when the self-test passed (or by the setter if that already happened). */
++void (*sweet_a618_ready_hook)(void);
++
++static struct {
++	bool     ready;         /* core initialised (and, once the self-test passed, usable by clients) */
++	bool     lost;          /* a submission did not complete or the SMMU faulted: nothing more goes to the CP */
++	uint32_t seqno;         /* last submitted sequence number */
++	uint32_t submissions, hangs;
++	uint64_t bytes_mapped;
++} a618_dev;
++static vm_offset_t a618_gpu, a618_smmu;         /* mappings of the GPU core and of the GPU SMMU */
++static vm_offset_t a618_ptp;                    /* page-table pool: kernel VA, PA, size, pages handed out */
++static uint64_t a618_ptp_pa;
++static unsigned a618_ptp_pages, a618_ptp_used;
++static struct {
++	uint64_t start, size;
++} a618_free[A618_GVM_MAXFREE];                  /* free iova ranges, sorted, coalesced */
++static unsigned a618_nfree;
++static int a618_published, a618_hook_fired;     /* accessed with __atomic builtins only */
++
++/*
++ * Physically contiguous, zeroed block switched to normal non-cacheable (WCOMB), exactly as gpu_cp_memory_setup does for
++ * the ring: the SMMU walker, the CP and the CPU all see the same bytes. Size must be a multiple of the xnu page size.
++ */
++static bool
++a618_dma_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
++{
++	vm_offset_t kva;
++
++	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPU: API core: no contiguous DMA memory (%lu bytes)\n", (unsigned long)size);
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (!pn || ptoa_64(pn) + size > (1ull << 36)) {
++		return false;
++	}
++	for (unsigned i = 1; i < size / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			printf("SWEET GPU: API core: DMA block not physically contiguous\n");
++			return false;
++		}
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	for (unsigned i = 0; i < size / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	*va = kva;
++	*pa = ptoa_64(pn);
++	return true;
++}
++
++/* A table page of the pool (zeroed by KMA_ZERO); 0 when the pool is used up. */
++static uint64_t
++a618_table_page(void)
++{
++	if (a618_ptp_used >= a618_ptp_pages) {
++		return 0;
++	}
++	return a618_ptp_pa + (uint64_t)(a618_ptp_used++) * A618_PTP_TABLE;
++}
++
++static volatile uint64_t *
++a618_table_va(uint64_t pa)
++{
++	if (!a618_ptp || pa < a618_ptp_pa || pa - a618_ptp_pa >= (uint64_t)a618_ptp_pages * A618_PTP_TABLE || (pa & 0xfff)) {
++		return NULL;
++	}
++	return (volatile uint64_t *)(a618_ptp + (pa - a618_ptp_pa));
++}
++
++/* Slot of the level-3 entry for iova; creates the missing tables when asked. NULL: not mapped, or the pool is full. */
++static volatile uint64_t *
++a618_slot(uint64_t iova, bool create)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(cp_memory + CP_L1), *tab;
++	uint64_t e, pa;
++	unsigned i1 = (unsigned)(iova >> 30) & 3, i2 = (unsigned)(iova >> 21) & 0x1ff, i3 = (unsigned)(iova >> 12) & 0x1ff;
++
++	if (!cp_memory || iova < A618_GVM_BASE || iova >= A618_GVM_END) {
++		return NULL;
++	}
++	e = l1[i1];
++	if ((e & 3) != PTE_TABLE) {
++		if (!create || !(pa = a618_table_page())) {
++			return NULL;
++		}
++		cp_write64(cp_memory, CP_L1 + 8 * i1, pa | PTE_TABLE);
++		e = pa | PTE_TABLE;
++	}
++	if (!(tab = a618_table_va(e & CP_PA_MASK))) {
++		return NULL;
++	}
++	e = tab[i2];
++	if ((e & 3) != PTE_TABLE) {
++		if (!create || !(pa = a618_table_page())) {
++			return NULL;
++		}
++		cp_write64((vm_offset_t)(tab + i2), 0, pa | PTE_TABLE);
++		e = pa | PTE_TABLE;
++	}
++	if (!(tab = a618_table_va(e & CP_PA_MASK))) {
++		return NULL;
++	}
++	return tab + i3;
++}
++
++/* TLBIALL of context bank 1, then TLBSYNC (the same registers gpu_cp_memory_setup uses). */
++static void
++a618_tlb_flush(void)
++{
++	vm_offset_t b = a618_smmu + SMMU_CB(CP_CB);
++
++	gpu_wr(b, SMMU_CB_TLBIALL, 0);
++	(void)smmu_sync(b, SMMU_CB_TLBSYNC, SMMU_CB_TLBSTATUS);
++}
++
++/* GPU core registers may be read only with GX on and the GMU AHB fence open (a closed fence drops or hangs accesses). */
++static bool
++a618_regs_safe(void)
++{
++	return a618_gpu && cc && gmu && (gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) &&
++	       !(gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF) && gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL) == 0;
++}
++
++/* True when the core is initialised and no submission failed. */
++bool
++sweet_a618_ready(void)
++{
++	return a618_dev.ready && !a618_dev.lost;
++}
++
++/* First-fit allocation of size bytes plus one unmapped guard page; taken is what sweet_a618_iova_free gets back. */
++bool
++sweet_a618_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken)
++{
++	if (!a618_dev.ready || !iova || !taken || size == 0 || (size & 0xfff) || size > A618_GVM_END - A618_GVM_BASE) {
++		return false;
++	}
++	uint64_t need = size + A618_GVM_GUARD;
++	for (unsigned i = 0; i < a618_nfree; i++) {
++		if (a618_free[i].size >= need) {
++			*iova = a618_free[i].start;
++			*taken = need;
++			a618_free[i].start += need;
++			a618_free[i].size -= need;
++			if (a618_free[i].size == 0) {
++				memmove(&a618_free[i], &a618_free[i + 1], (a618_nfree - i - 1) * sizeof(a618_free[0]));
++				a618_nfree--;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Take exactly [iova, iova+size) out of the free list (a client that chose its own address). */
++bool
++sweet_a618_iova_reserve(uint64_t iova, uint64_t size)
++{
++	if (!a618_dev.ready || size == 0 || (size & 0xfff) || (iova & 0xfff) || iova < A618_GVM_BASE ||
++	    size > A618_GVM_END - A618_GVM_BASE || iova > A618_GVM_END - size) {
++		return false;
++	}
++	for (unsigned i = 0; i < a618_nfree; i++) {
++		uint64_t s = a618_free[i].start, e = s + a618_free[i].size;
++		if (iova < s || iova + size > e) {
++			continue;
++		}
++		if (iova == s && iova + size == e) {
++			memmove(&a618_free[i], &a618_free[i + 1], (a618_nfree - i - 1) * sizeof(a618_free[0]));
++			a618_nfree--;
++		} else if (iova == s) {
++			a618_free[i].start += size;
++			a618_free[i].size -= size;
++		} else if (iova + size == e) {
++			a618_free[i].size -= size;
++		} else {
++			if (a618_nfree == A618_GVM_MAXFREE) {
++				return false;
++			}
++			memmove(&a618_free[i + 1], &a618_free[i], (a618_nfree - i) * sizeof(a618_free[0]));
++			a618_nfree++;
++			a618_free[i].size = iova - s;
++			a618_free[i + 1].start = iova + size;
++			a618_free[i + 1].size = e - (iova + size);
++		}
++		return true;
++	}
++	return false;
++}
++
++/* Give a range back, coalescing; a full list drops the range (address space is lost, never corrupted). */
++void
++sweet_a618_iova_free(uint64_t iova, uint64_t size)
++{
++	unsigned i = 0;
++
++	if (size == 0 || iova < A618_GVM_BASE || size > A618_GVM_END - A618_GVM_BASE || iova > A618_GVM_END - size) {
++		return;
++	}
++	while (i < a618_nfree && a618_free[i].start < iova) {
++		i++;
++	}
++	if (i > 0 && a618_free[i - 1].start + a618_free[i - 1].size == iova) {
++		a618_free[i - 1].size += size;
++		if (i < a618_nfree && a618_free[i - 1].start + a618_free[i - 1].size == a618_free[i].start) {
++			a618_free[i - 1].size += a618_free[i].size;
++			memmove(&a618_free[i], &a618_free[i + 1], (a618_nfree - i - 1) * sizeof(a618_free[0]));
++			a618_nfree--;
++		}
++		return;
++	}
++	if (i < a618_nfree && iova + size == a618_free[i].start) {
++		a618_free[i].start = iova;
++		a618_free[i].size += size;
++		return;
++	}
++	if (a618_nfree == A618_GVM_MAXFREE) {
++		printf("SWEET GPU: API core: iova free list full; %#llx+%#llx lost\n", iova, size);
++		return;
++	}
++	memmove(&a618_free[i + 1], &a618_free[i], (a618_nfree - i) * sizeof(a618_free[0]));
++	a618_nfree++;
++	a618_free[i].start = iova;
++	a618_free[i].size = size;
++}
++
++/* Map one 4 KiB GPU page; false when the table pool is full or pa does not fit the SMMU. No TLB work: submit does it. */
++bool
++sweet_a618_vm_map(uint64_t iova, uint64_t pa, bool readonly)
++{
++	volatile uint64_t *slot;
++
++	if (!a618_dev.ready || (pa & ~CP_PA_MASK) || (iova & 0xfff) || !(slot = a618_slot(iova, true))) {
++		return false;
++	}
++	cp_write64((vm_offset_t)slot, 0, pa | PTE_PAGE_NC | (readonly ? (1ull << 7) : 0));     /* AP[2] = read-only */
++	a618_dev.bytes_mapped += 0x1000;
++	return true;
++}
++
++/* Clear the pages of [iova, iova+size) and invalidate the context's TLB. */
++void
++sweet_a618_vm_unmap(uint64_t iova, uint64_t size)
++{
++	if (!a618_ptp || !a618_smmu) {
++		return;
++	}
++	for (uint64_t d = 0; d < size; d += 0x1000) {
++		volatile uint64_t *slot = a618_slot(iova + d, false);
++		if (slot && *slot) {
++			cp_write64((vm_offset_t)slot, 0, 0);
++			a618_dev.bytes_mapped -= 0x1000;
++		}
++	}
++	a618_tlb_flush();
++}
++
++/* Make CPU stores to kernel memory visible to the GPU and drop stale lines (dc civac by VA). */
++void
++sweet_a618_cache_sync(void *va, size_t len)
++{
++	sweet_dma_sync_va(va, len);
++}
++
++/* msm MSM_PARAM_* numbers (include/uapi/drm/msm_drm.h); false for parameters this core does not answer. */
++bool
++sweet_a618_param(uint32_t which, uint64_t *value)
++{
++	if (!a618_dev.ready || !value) {
++		return false;
++	}
++	switch (which) {
++	case 1:  *value = 618; return true;                     /* GPU_ID */
++	case 2:  *value = 0x80000; return true;                 /* GMEM_SIZE: 512 KiB */
++	case 3:  *value = A618_CHIP_ID; return true;            /* CHIP_ID */
++	case 4:  /* MAX_FREQ: top level of the fused speed bin's DT table (gpu_dcvs_votes); 0 when that table was not built.
++	          * The GPU itself stays at the boot level (180 MHz, no DCVS yet). */
++		*value = gx_levels ? (uint64_t)gx_khz[gx_levels - 1] * 1000ull : 0;
++		return true;
++	case 5:  /* TIMESTAMP: the GMU always-on counter (19.2 MHz), what Linux a6xx_get_timestamp reads */
++		*value = (uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_L) | ((uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_H) << 32);
++		return true;
++	case 6:  *value = 0x100000; return true;                /* GMEM_BASE */
++	case 7:  *value = 1; return true;                       /* PRIORITIES */
++	case 8:  *value = 0; return true;                       /* PP_PGTABLE */
++	case 9:  *value = a618_dev.hangs; return true;          /* FAULTS */
++	case 10: *value = 0; return true;                       /* SUSPENDS: the GPU never suspends here */
++	case 14: *value = A618_GVM_BASE; return true;           /* VA_START */
++	case 15: *value = A618_GVM_END - A618_GVM_BASE; return true;    /* VA_SIZE */
++	case 16: *value = 14; return true;                      /* HIGHEST_BANK_BIT (Linux ubwc_config.c, sc7180: ubwc_2_0_hbb14) */
++	case 18: *value = 6; return true;                       /* UBWC_SWIZZLE (inference: the Linux a6xx default) */
++	case 19: *value = 0; return true;                       /* MACROTILE_MODE (inference: 4 channels) */
++	default: return false;
++	}
++}
++
++uint32_t
++sweet_a618_fence_last(void)
++{
++	return a618_dev.seqno;
++}
++
++/* The CP wrote this sequence number (or a later one) to the fence word; polling only. */
++bool
++sweet_a618_fence_done(uint32_t fence)
++{
++	if (!cp_memory) {
++		return false;
++	}
++	vm_offset_t word = cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE;
++	sweet_dma_sync_va((const void *)word, sizeof(uint32_t));
++	uint32_t v = *(volatile uint32_t *)word;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return (int32_t)(v - fence) >= 0;
++}
++
++/* What the CP says when a submission does not come back. */
++void
++sweet_a618_report(const char *why)
++{
++	uint32_t done = cp_memory ? *(volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE) : 0;
++
++	printf("SWEET GPU: %s: submitted %u, completed %u, ring WPTR %u\n", why, a618_dev.seqno, done, cp_ring_wptr);
++	if (a618_regs_safe()) {
++		printf("SWEET GPU: %s: ring RPTR %u RBBM_STATUS %#x CP_STATUS_1 %#x HW_FAULT %#x CP_IRQ %#x PROTECT %#x RBBM_IRQ %#x\n",
++		    why, gpu_rd(a618_gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(a618_gpu, A6XX_RBBM_STATUS * 4),
++		    gpu_rd(a618_gpu, A6XX_CP_STATUS_1 * 4), gpu_rd(a618_gpu, A6XX_CP_HW_FAULT * 4),
++		    gpu_rd(a618_gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(a618_gpu, A6XX_CP_PROTECT_STATUS * 4),
++		    gpu_rd(a618_gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	} else {
++		printf("SWEET GPU: %s: GPU registers not read (GX off or AHB fence closed)\n", why);
++	}
++	if (a618_smmu) {
++		vm_offset_t b = a618_smmu + SMMU_CB(CP_CB);
++		printf("SWEET GPU: %s: SMMU CB%u FSR %#x FAR %#x%08x FSYNR0 %#x, global GFSR %#x\n", why, CP_CB,
++		    gpu_rd(b, SMMU_CB_FSR), gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0),
++		    gpu_rd(a618_smmu, SMMU_sGFSR));
++	}
++	sweet_log_sync();
++}
++
++/* The GPU stopped answering; no recovery is attempted: nothing more is submitted. */
++void
++sweet_a618_mark_lost(void)
++{
++	if (!a618_dev.lost) {
++		a618_dev.lost = true;
++		a618_dev.hangs++;
++		sweet_a618_report("GPU LOST (no completion)");
++	}
++}
++
++/* A translation fault of context bank 1: log, clear, declare the GPU lost (the CP stays wedged on the access). */
++static bool
++a618_check_fault(void)
++{
++	vm_offset_t b = a618_smmu + SMMU_CB(CP_CB);
++	uint32_t fsr = gpu_rd(b, SMMU_CB_FSR);
++
++	if (!(fsr & A618_SMMU_FAULT_BITS)) {
++		if (fsr) {
++			gpu_wr(b, SMMU_CB_FSR, fsr);    /* stale status bits (0x400 from boot) */
++		}
++		return false;
++	}
++	printf("SWEET GPU: SMMU CB%u FAULT: FSR %#x FAR %#x%08x FSYNR0 %#x\n", CP_CB, fsr,
++	    gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0));
++	gpu_wr(b, SMMU_CB_FSR, fsr);
++	if (!a618_dev.lost) {
++		a618_dev.lost = true;
++		a618_dev.hangs++;
++		sweet_a618_report("GPU LOST (SMMU fault)");
++	}
++	return true;
++}
++
++/*
++ * One submission: invalidate the CCU (2 events), one CP_INDIRECT_BUFFER per IB (address lo/hi, size in dwords), then
++ * CACHE_FLUSH_TS writing the new sequence number to the fence word (the tail of Linux a6xx_submit). The context's TLB is
++ * invalidated first (sweet_a618_vm_map does not do it). Returns the sequence number, or 0 when refused: not ready,
++ * lost, bad arguments, GX off, an SMMU fault, or no ring room for 2 s (which also marks the GPU lost).
++ */
++uint32_t
++sweet_a618_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
++{
++	unsigned need = 16 + 4 * count, room = 0;
++
++	if (!sweet_a618_ready() || !ib_iova || !ib_dwords || count == 0 || count > A618_MAX_IBS) {
++		return 0;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		/* an IB must lie in the client range (never the ring, SQE or scratch) and fit the 20-bit size field */
++		if ((ib_iova[i] & 3) || ib_iova[i] < A618_GVM_BASE || ib_dwords[i] == 0 || ib_dwords[i] >= (1u << 20) ||
++		    ib_iova[i] + 4ull * ib_dwords[i] > A618_GVM_END) {
++			return 0;
++		}
++	}
++	if (!(gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) || (gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF)) {
++		sweet_a618_report("submit refused: GX is off");
++		return 0;
++	}
++	if (a618_check_fault()) {
++		return 0;
++	}
++	if (gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL) != 0) {
++		printf("SWEET GPU: submit: AHB fence was %#x (not ALLOW); set to ALLOW\n", gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL));
++		gpu_wr(gmu, GMU_AO_AHB_FENCE_CTRL, 0);
++	}
++	for (unsigned i = 0; i < 20000; i++) {
++		uint32_t rptr = gpu_rd(a618_gpu, A6XX_CP_RB_RPTR * 4);
++		room = (rptr + CP_RING_BYTES / 4 - cp_ring_wptr - 1) % (CP_RING_BYTES / 4);
++		if (room >= need) {
++			break;
++		}
++		delay(100);
++	}
++	if (room < need) {
++		sweet_a618_mark_lost();
++		return 0;
++	}
++	a618_tlb_flush();
++	if (++a618_dev.seqno == 0) {
++		a618_dev.seqno = 1;
++	}
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
++	cp_ring_emit(A618_PC_CCU_INVALIDATE_DEPTH);
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
++	cp_ring_emit(A618_PC_CCU_INVALIDATE_COLOR);
++	for (unsigned i = 0; i < count; i++) {
++		cp_ring_emit(cp_pkt7(CP_INDIRECT_BUFFER, 3));
++		cp_ring_emit((uint32_t)ib_iova[i]);
++		cp_ring_emit((uint32_t)(ib_iova[i] >> 32));
++		cp_ring_emit(ib_dwords[i]);
++	}
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 4));
++	cp_ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + A618_SCRATCH_FENCE));
++	cp_ring_emit(0);
++	cp_ring_emit(a618_dev.seqno);
++	cp_ring_flush(a618_gpu);
++	a618_dev.submissions++;
++	return a618_dev.seqno;
++}
++
++/* Fire the ready hook once, as soon as the self-test passed and a hook is set (either order, no lock). */
++static void
++a618_try_hook(void)
++{
++	void (*hook)(void) = __atomic_load_n(&sweet_a618_ready_hook, __ATOMIC_SEQ_CST);
++
++	if (__atomic_load_n(&a618_published, __ATOMIC_SEQ_CST) && hook != NULL &&
++	    __atomic_exchange_n(&a618_hook_fired, 1, __ATOMIC_SEQ_CST) == 0) {
++		printf("SWEET GPU: API core ready: calling the ready hook\n");
++		sweet_log_sync();
++		hook();
++	}
++}
++
++/* Set the ready hook; calls it right away (in the caller's context) when the core is already published. */
++void
++sweet_a618_set_ready_hook(void (*hook)(void))
++{
++	__atomic_store_n(&sweet_a618_ready_hook, hook, __ATOMIC_SEQ_CST);
++	a618_try_hook();
++}
++
++/*
++ * API self-test (no IOKit): two kernel pages (16 KiB each, WCOMB) are mapped at iovas from sweet_a618_iova_alloc, one with
++ * the first_store shader, its UAV descriptor and the command stream, the other as the shader's target. The stream is
++ * cs_ib of gpu_cp_dispatch_test relocated at run time: its hard-coded VAs (shader 0x40022000, descriptor 0x40022400,
++ * timestamp 0x40020160) are replaced by the new ones, the descriptor's buffer address (dword 4) points at the target.
++ * It runs twice through sweet_a618_submit + sweet_a618_fence_done and expects dword 0 of the target to become
++ * 0xcafe0001 and the stream's own CACHE_FLUSH_TS word to become CS_TS_SEQ, then unmaps, frees and checks that the iova
++ * list coalesced back to the full window.
++ */
++#define A618_ST_SHADER_OFF      0x0u            /* in the code page */
++#define A618_ST_DESC_OFF        0x400u
++#define A618_ST_IB_OFF          0x1000u
++#define A618_ST_TS_OFF          0x100u          /* in the data page; the target is dword 0 of it */
++#define A618_ST_ROUNDS          2
++#define A618_ST_OLD_SHADER_VA   0x40022000u     /* constants of cs_ib to relocate */
++#define A618_ST_OLD_DESC_VA     0x40022400u
++#define A618_ST_OLD_TS_VA       0x40020160u
++
++static bool
++a618_selftest(void)
++{
++	const char *err = NULL;
++	vm_offset_t kva = 0;
++	uint64_t pa = 0, iova_code = 0, iova_data = 0, taken_code = 0, taken_data = 0;
++	uint32_t fences[A618_ST_ROUNDS] = { 0 };
++	uint32_t last_target = 0, last_ts = 0;
++	bool mapped = false;
++	unsigned ib_dw = (unsigned)(sizeof(cs_ib) / sizeof(cs_ib[0])), hit_shader = 0, hit_desc = 0, hit_ts = 0;
++	uint32_t ib[sizeof(cs_ib) / sizeof(cs_ib[0])];
++
++	printf("SWEET GPU: API selftest: starting (2 x %u-dword compute dispatch through the sweet_a618_* API)\n", ib_dw);
++	sweet_log_sync();
++	do {
++		if (!a618_dma_alloc(2 * PAGE_SIZE, &kva, &pa)) {
++			err = "no memory for the two test pages";
++			break;
++		}
++		if (!sweet_a618_iova_alloc(PAGE_SIZE, &iova_code, &taken_code) ||
++		    !sweet_a618_iova_alloc(PAGE_SIZE, &iova_data, &taken_data)) {
++			err = "sweet_a618_iova_alloc failed";
++			break;
++		}
++		mapped = true;         /* unmap below is harmless for pages that were not mapped */
++		for (uint64_t off = 0; off < PAGE_SIZE; off += 0x1000) {
++			if (!sweet_a618_vm_map(iova_code + off, pa + off, false) ||
++			    !sweet_a618_vm_map(iova_data + off, pa + PAGE_SIZE + off, false)) {
++				err = "sweet_a618_vm_map failed";
++				break;
++			}
++		}
++		if (err) {
++			break;
++		}
++		for (unsigned i = 0; i < ib_dw; i++) {
++			uint32_t v = cs_ib[i];
++			if (v == A618_ST_OLD_SHADER_VA) {
++				v = (uint32_t)iova_code + A618_ST_SHADER_OFF;
++				hit_shader++;
++			} else if (v == A618_ST_OLD_DESC_VA) {
++				v = (uint32_t)iova_code + A618_ST_DESC_OFF;
++				hit_desc++;
++			} else if (v == A618_ST_OLD_TS_VA) {
++				v = (uint32_t)iova_data + A618_ST_TS_OFF;
++				hit_ts++;
++			}
++			ib[i] = v;
++		}
++		if (hit_shader != 2 || hit_desc != 2 || hit_ts != 1 || cs_uav_desc[4] != 0x40022800u) {
++			err = "command stream relocation did not match the generated stream";
++			break;
++		}
++		volatile uint32_t *code = (volatile uint32_t *)kva, *data = (volatile uint32_t *)(kva + PAGE_SIZE);
++		for (unsigned i = 0; i < sizeof(cs_shader) / 4; i++) {
++			code[A618_ST_SHADER_OFF / 4 + i] = cs_shader[i];
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			code[A618_ST_DESC_OFF / 4 + i] = cs_uav_desc[i];
++		}
++		code[A618_ST_DESC_OFF / 4 + 4] = (uint32_t)iova_data;   /* the UAV buffer: dword 0 of the data page */
++		for (unsigned i = 0; i < ib_dw; i++) {
++			code[A618_ST_IB_OFF / 4 + i] = ib[i];
++		}
++		for (unsigned round = 0; round < A618_ST_ROUNDS && !err; round++) {
++			for (unsigned i = 0; i < 4; i++) {
++				data[i] = 0xdeadbee0u + i;
++			}
++			data[A618_ST_TS_OFF / 4] = 0;
++			sweet_a618_cache_sync((void *)kva, 2 * PAGE_SIZE);
++			uint64_t ib_va = iova_code + A618_ST_IB_OFF;
++			uint32_t fence = sweet_a618_submit(&ib_va, &ib_dw, 1);
++			if (fence == 0) {
++				err = "sweet_a618_submit refused the dispatch";
++				break;
++			}
++			fences[round] = fence;
++			unsigned i;
++			for (i = 0; i < 10000 && !sweet_a618_fence_done(fence); i++) {
++				delay(100);
++			}
++			if (i == 10000) {
++				sweet_a618_report("API selftest: fence timeout");
++				err = "fence did not complete within 1 s";
++				break;
++			}
++			for (i = 0; i < 10000 && (data[0] != 0xcafe0001u || data[A618_ST_TS_OFF / 4] != CS_TS_SEQ); i++) {
++				sweet_a618_cache_sync((void *)(kva + PAGE_SIZE), 0x200);
++				delay(10);
++			}
++			last_target = data[0];
++			last_ts = data[A618_ST_TS_OFF / 4];
++			printf("SWEET GPU: API selftest: round %u fence %u done, target %#x (want 0xcafe0001), ts %#x (want %#x)\n",
++			    round + 1, fence, last_target, last_ts, CS_TS_SEQ);
++			if (last_target != 0xcafe0001u || last_ts != CS_TS_SEQ) {
++				err = "target or timestamp word wrong after the fence";
++			}
++		}
++		if (err) {
++			break;
++		}
++		if (fences[1] != fences[0] + 1 || sweet_a618_fence_last() != fences[1]) {
++			err = "fence numbers not consecutive";
++		}
++	} while (0);
++	if (mapped) {
++		sweet_a618_vm_unmap(iova_code, taken_code);
++		sweet_a618_vm_unmap(iova_data, taken_data);
++	}
++	if (taken_data) {
++		sweet_a618_iova_free(iova_data, taken_data);
++	}
++	if (taken_code) {
++		sweet_a618_iova_free(iova_code, taken_code);
++	}
++	if (!err && (a618_dev.bytes_mapped != 0 || a618_nfree != 1 || a618_free[0].start != A618_GVM_BASE ||
++	    a618_free[0].size != A618_GVM_END - A618_GVM_BASE)) {
++		err = "unmap/free left mappings or a fragmented iova list";
++	}
++	if (err) {
++		printf("SWEET GPU: API selftest FAILED: %s (fences %u %u, target %#x, ts %#x, mapped %llu, free ranges %u)\n", err,
++		    fences[0], fences[1], last_target, last_ts, a618_dev.bytes_mapped, a618_nfree);
++		a618_dev.ready = false;         /* nothing is published; the GPU stays up until reset */
++	} else {
++		printf("SWEET GPU: API selftest PASSED: %u dispatches through iova_alloc/vm_map/submit/fence_done, fences %u %u, unmap and free clean\n",
++		    A618_ST_ROUNDS, fences[0], fences[1]);
++	}
++	sweet_log_sync();
++	return err == NULL;
++}
++
++static void
++a618_selftest_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	if (a618_selftest()) {
++		__atomic_store_n(&a618_published, 1, __ATOMIC_SEQ_CST);
++		a618_try_hook();
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * sweetgpu=11, after gpu_gx_test left the GPU up (GX on, OOB_GPU and OOB_BOOT_SLUMBER held exactly as in the proven
++ * sweetgpukeep=1 state, zap running, SQE running, ring idle): set up the client address space and the fence word, then
++ * start the self-test thread. No keep-alive thread and no shutdown: the GPU stays up until reset.
++ */
++static void
++a618_core_start(void)
++{
++	thread_t thread;
++
++	a618_gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	a618_smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!a618_gpu || !a618_smmu || !cp_memory || !cp_memory_pa || !gpu_cp_context_intact(a618_smmu)) {
++		printf("SWEET GPU: API core: prerequisites missing; not started (GPU stays up until reset)\n");
++		sweet_log_sync();
++		return;
++	}
++	a618_ptp_pages = A618_PTP_PAGES;
++	if (!a618_dma_alloc((vm_size_t)a618_ptp_pages * A618_PTP_TABLE, &a618_ptp, &a618_ptp_pa)) {
++		a618_ptp_pages = A618_PTP_PAGES_MIN;
++		if (!a618_dma_alloc((vm_size_t)a618_ptp_pages * A618_PTP_TABLE, &a618_ptp, &a618_ptp_pa)) {
++			a618_ptp = 0;
++			printf("SWEET GPU: API core: no memory for the GPU page-table pool; not started\n");
++			sweet_log_sync();
++			return;
++		}
++	}
++	a618_ptp_used = 0;
++	a618_free[0].start = A618_GVM_BASE;
++	a618_free[0].size = A618_GVM_END - A618_GVM_BASE;
++	a618_nfree = 1;
++	*(volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE) = 0;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++	a618_dev.seqno = 0;
++	a618_dev.ready = true;
++	printf("SWEET GPU: API core: GPU kept up (OOB_GPU held), ring %u dwords at RPTR=WPTR=%u, client VA %#llx-%#llx, %u table pages\n",
++	    CP_RING_BYTES / 4, cp_ring_wptr, A618_GVM_BASE, A618_GVM_END, a618_ptp_pages);
++	sweet_log_sync();
++	if (kernel_thread_start(a618_selftest_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GPU: API core: kernel_thread_start failed; running the self-test inline\n");
++		if (a618_selftest()) {
++			__atomic_store_n(&a618_published, 1, __ATOMIC_SEQ_CST);
++			a618_try_hook();
++		}
++	}
++}
++
 +static void
 +gpu_keep_thread(void *arg, wait_result_t result)
 +{
@@ -3029,11 +3765,15 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +			gx = rail && gpu_sptprac(true);
 +		}
 +		if (booted && (mode < 6 || gx) && gpu_hfi_start() && mode >= 6) {
-+			if (!gpu_gx_test(mode >= 7, mode >= 9, mode >= 10)) {
++			if (!gpu_gx_test(mode >= 7, mode >= 9, mode >= 10, mode >= 11)) {
 +				return;
 +			}
 +			if (gpu_kept) {
-+				gpu_keep_start();
++				if (mode >= 11) {
++					a618_core_start();    /* permanent core + sweet_a618_* API */
++				} else {
++					gpu_keep_start();
++				}
 +				return;
 +			}
 +		} else if (rail) {
