@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3413 @@
+@@ -0,0 +1,3414 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -3516,8 +3516,9 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	if (taken_code) {
 +		sweet_a618_iova_free(iova_code, taken_code);
 +	}
-+	if (!err && (a618_dev.bytes_mapped != 0 || a618_nfree != 1 || a618_free[0].start != A618_GVM_BASE ||
-+	    a618_free[0].size != A618_GVM_END - A618_GVM_BASE)) {
++	/* with VA recycling off (default) the ranges are not returned: only the mapping count can be checked */
++	if (!err && (a618_dev.bytes_mapped != 0 || (a618_recycle_va && (a618_nfree != 1 || a618_free[0].start != A618_GVM_BASE ||
++	    a618_free[0].size != A618_GVM_END - A618_GVM_BASE)))) {
 +		err = "unmap/free left mappings or a fragmented iova list";
 +	}
 +	if (err) {
