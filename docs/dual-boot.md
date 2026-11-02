@@ -99,17 +99,35 @@ Fino a quando non si sceglie, il ripiego semplice resta lo scambio di `boot` dal
 - Il kernel monta oggi la radice con `rd=ufsroot0`, cioè la partizione `userdata` intera [fatto]. Bisogna sceglierla per nome o per indice (`iosroot`). Il codice di accesso UFS e GPT esiste già in Enxerto (`partition-size:`, scansione GPT) [fatto].
 - `tools/bergamota-flash.py` e Bergamota fastboot ammettono solo `userdata`, `boot` e `logo` [fatto]: `iosroot` e `boot_android` vanno aggiunte alla lista consentita, e solo in quel punto.
 
-## 6. Rischi
+## 6. Rischi, e come non rischiare di brickare il telefono
 
-- **Una GPT sbagliata può rendere il telefono non avviabile.** Mitigazione: backup della GPT prima, controllo CRC, doppia copia, test su un backup letto dal telefono, e il fastboot di Xiaomi (Power + Volume Giù) resta sempre raggiungibile perché sta in `abl`, non toccata.
-- Android può provare a ridimensionare o riformattare la propria partizione al primo avvio: va bene finché la partizione `userdata` Android è separata e non confina con quella iOS [ipotesi].
-- Aggiornamenti OTA di Android sono fuori portata (`boot` non è più il suo).
-- Il dual boot non riguarda il supporto di Wi-Fi, audio o GPU in iOS; è indipendente dal resto della tabella di marcia.
+**Il rischio principale è la GPT del LUN 0.** Se la tabella viene scritta male (CRC sbagliato, copia secondaria non allineata, partizioni spostate o sovrapposte), ABL o Android possono non trovare più `persist`, `super`, `modem`, `boot`. Un hard brick vero richiederebbe che anche il fastboot di Xiaomi non partisse. I bootloader (`xbl`, `abl`, `tz`) stanno su altri LUN (sdb-sdf) [fatto, dai nomi dei backup], quindi in teoria il fastboot resta raggiungibile con la GPT del LUN 0 rotta [ipotesi, non verificata: dipende da cosa ABL controlla all'avvio]. Il piano B, l'EDL di Qualcomm, sul Poco X3 NFC richiede in genere un'autorizzazione Xiaomi per scrivere [ipotesi, da verificare], quindi non va considerato una rete di sicurezza.
+
+**Cosa lo rende sicuro (regole da rispettare):**
+1. **Nessuna partizione viene spostata.** Si modifica solo la fine di `userdata` (ultima del LUN, riduzione) e si aggiungono le nuove voci `iosroot` e `boot_android` **dopo**, nello spazio liberato. `persist`, `modem`, `super`, `recovery` e le altre restano con gli stessi indirizzi, byte per byte. Nella tabella ci sono 32 posti e ne sono usati 16 [fatto].
+2. Backup prima: la testa del LUN (`lun-sda-head1M.img`, già presa) **e la coda** con la GPT secondaria, più un controllo di rilettura.
+3. Strumento con `--dry-run`: stampa le due tabelle (prima e dopo), verifica i CRC e le sovrapposizioni con un parser indipendente, e non scrive se qualcosa non torna.
+4. Scrittura prima della copia secondaria o dell'ultima? Ordine e comportamento in caso di interruzione vanno decisi e provati; un'interruzione a metà tra le due copie è il caso peggiore.
+5. Verifica dopo la scrittura: rilettura completa e confronto, poi un riavvio in fastboot di Xiaomi (Power + Volume Giù) **prima** di toccare altro.
+6. Ripristino già provato: il ripristino della testa del LUN dal backup deve essere un comando che abbiamo testato su un'immagine, e va scelto un metodo che non dipenda dalla GPT che si vuole riparare (oggi Bergamota non scrive la GPT: va aggiunto, con lista consentita ristretta).
+7. Un tuo OK esplicito per ogni scrittura, come già regola del progetto.
+
+**Variante senza toccare la GPT (rischio solo di perdere dati, non di brickare):**
+- Si tiene `userdata` com'è. Android usa una f2fs formattata più piccola, nella prima parte (circa 50 GiB); iOS usa la parte finale, con un offset noto, senza una partizione dedicata.
+- Il kernel iOS e Enxerto leggono l'offset da una cmdline; il selettore riconosce i sistemi dai magic (f2fs in testa, HFS+ all'offset).
+- Svantaggi [ipotesi]: Android può tentare di estendere o riformattare la f2fs fino a riempire la partizione (resize automatico al primo avvio, "Format Data" da OrangeFox): in quel caso cancella la parte iOS. Non c'è un confine imposto dalla tabella.
+- Vantaggio: se qualcosa va storto si perdono solo dati di `userdata`, che si possono riscrivere (come già successo oggi). Serve a provare il selettore e l'avvio di Android prima di decidere se vale la pena toccare la GPT.
+
+**Altri rischi**
+- Android può provare a ridimensionare o riformattare la sua partizione al primo avvio: accettabile finché `userdata` Android è separata da quella iOS.
+- Gli aggiornamenti OTA di Android non funzionano più (`boot` non è suo).
+- Il dual boot è indipendente dal supporto di Wi-Fi, audio o GPU in iOS.
 
 ## 7. Ordine di lavoro suggerito
 
 1. Decidere le dimensioni definitive (sezione 3) e il sistema predefinito.
 2. Salvare la GPT (sola lettura, copia primaria e secondaria) e scrivere i valori reali.
+   **Prima prova consigliata: la variante senza GPT (sezione 6), che non può brickare il telefono.** Decidere se toccare la GPT solo dopo.
 3. Ripiego dall'host (scambio di `boot`): costa poco, utile da subito per tornare ad Android.
 4. Strumento di partizionamento con `--dry-run`, un OK esplicito prima della scrittura.
 5. Nel kernel: montare `iosroot` per nome; poi riflash della radice iOS nella nuova partizione.
