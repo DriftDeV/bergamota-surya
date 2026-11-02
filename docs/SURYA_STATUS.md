@@ -39,6 +39,8 @@ Dettagli cronologici e log: `NOTES.md`. Piano di quanto resta: `docs/SURYA_ROADM
 
 - **[fatto, 2026-11-02] Riavvio da iOS su surya** (patch 0318, CI 41474418738, immagine `enxerto-boot-ios18-reboot.img`): `ssh root@192.168.7.2 sweetreboot normal` fa rientrare il telefono in Bergamota fastboot da solo in circa 15 s, senza tasti (IMEM `0x146aa65c` + `PSCI SYSTEM_RESET`, nessun `PS_HOLD`/PMIC). `tools/surya-test.sh` lo usa quando iOS è ancora acceso.
 
+- **[in corso, 2026-11-02] Client kernel Adreno 618** (patch 0301 `sweetgpu=11` + 0320 `SweetAdreno618` + `gpu/surya-test`): selftest del kernel e servizio pubblicato OK; dal userland servizio, parametri, buffer, mappatura e sottomissione OK, ma `WAIT_FENCE` scade con un fault SMMU su `0x80005000` (ipotesi: cache GPU con stato vecchio per indirizzi virtuali riusati). Correzione committata (`9918a4c`, `bae5bd9`), non ancora provata sul telefono. Dettagli e ripresa in `NOTES.md` (handoff 2026-11-02 ~19:30).
+
 ## Documentazione e ricerche prodotte
 - `docs/gpu.md`, `docs/audio.md`, `docs/wifi.md`, `docs/bluetooth.md`, `docs/cameras.md` (stato, piani, rischi per ogni blocco hardware).
 - `docs/dual-boot.md` (idea futura Android + iOS, rischio GPT, variante solo `userdata`, riferimento woa-vayu).
