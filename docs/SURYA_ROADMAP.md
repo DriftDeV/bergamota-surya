@@ -5,7 +5,7 @@ Ogni scrittura sul telefono (`userdata`, `boot`, GPT) richiede l'OK esplicito de
 
 ## 1. GPU Adreno 618: dal primo comando al rendering (priorità attuale)
 1. ~~Tenere acceso GPU e zap dopo il test~~ **fatto il 2026-11-02** (`sweetgpukeep=1`: sei giri consecutivi passati, nessun reset). Resta da fare lo stato permanente, senza spegnimento dopo sei giri, quando serviranno carichi di lavoro continui.
-2. **Primo buffer di comandi reale**: un indirect buffer con un calcolo o un disegno semplice, e lettura del risultato dalla memoria.
+2. **Primo buffer di comandi reale** (fatto: IB con scrittura, lettura di registro e timestamp; fatto: Mesa e primo shader assemblato, `tools/ir3asm`; **da fare: eseguire lo shader**, cioè emettere lo stato di calcolo SP/HLSQ e `CP_EXEC_CS`, riferimento `computerator/a6xx.cc`, e leggere `0xcafe0001` dal buffer): un indirect buffer con un calcolo o un disegno semplice, e lettura del risultato dalla memoria.
 3. **Client kernel con ioctl nella forma di `msm`** (modello patch 0182/`SweetAdreno630`): memoria GPU (GEM e IOVA tramite SMMU), sottomissione di buffer di comandi, fence, mappature per processo.
 4. **Userland**: Mesa Turnip con la voce a618 (da verificare nel Mesa 26.2.5 usato dal progetto), poi Chlorophyll (Metal su Turnip, già in esecuzione sul Poco F1) adattato alla a618: GMEM da 512 KiB, `highest_bank_bit` 14, tabella `hwcg`.
 5. **IOSurface e compositing**: far disegnare CoreAnimation/SpringBoard dalla GPU, poi fluidità (oggi tutto è su CPU a 30 Hz).
