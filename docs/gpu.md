@@ -223,3 +223,17 @@ Fonti lette: wiki postmarketOS "Xiaomi POCO X3 NFC (xiaomi-surya)" e "Qualcomm S
 - Esperimento proposto (Run D): caricare lo zap nella regione fissa `0x97715000` (mappata dal kernel come memoria I/O non cacheable, non allocata dal pool), mantenendo il resto uguale. Va controllato prima che quella regione sia riservata e non mappata nel nostro ADT.
 
 **Prossime letture utili:** `a6xx_gpu.c` e `a6xx_gmu.c` di `sm7150-mainline/linux` (differenze rispetto a upstream), il pacchetto `firmware-xiaomi-surya` (da dove viene `a615_zap.mbn`), la parte audio e touch del devicetree.
+
+## 5.4 steelbrain/metal2vulkan (letto il 2026-11-02, solo README e struttura, nessun codice letto né compilato)
+
+Cos'è [fatto, README]: un traduttore da Metal AIR (metallib o bitcode AIR) a SPIR-V per pipeline Vulkan (compute, render, tessellation, tile, mesh), più un runtime che offre l'API Metal sopra un dispositivo Vulkan 1.2 tramite `ash`. Scritto in Rust (richiede Rust 1.98), con tre crate pubblicate (`metal2vulkan`, `metal2vulkan-runtime`, `metal2vulkan-air`). Beta, repository creato il 2026-07-22, ultimo push 2026-10-31, un solo autore, 303 stelle. Non pubblica shader di terzi. Promette rifiuti tipizzati (un input non eseguibile esattamente fallisce con un errore che nomina la funzione Metal), differenze di precisione registrate, e confronti con Metal reale nella suite di validazione (`docs/VALIDATION.md`).
+
+**Licenza** [fatto]: `GPL-2.0-or-later OR LGPL-3.0-or-later` a scelta. Linkarla come libreria dinamica sotto LGPL-3 è compatibile con un uso separato, ma le modifiche vanno pubblicate; per coerenza con la prassi del progetto (solo fatti, niente copia da codice con altra licenza) conviene leggerla come riferimento e usarla, se mai, come dipendenza non modificata.
+
+**Rispetto a Chlorophyll** (Metal su Turnip, AIR→NIR dentro Mesa, già in esecuzione sul Poco F1):
+- metal2vulkan produce SPIR-V da AIR e lascia a un driver Vulkan (qui Turnip) il resto; Chlorophyll entra in Mesa a livello NIR. Sono due front end AIR indipendenti.
+- Utile come **riferimento di copertura**: `docs/METAL-COVERAGE.md` e `docs/REFUSALS.md` elencano cosa Metal accetta e cosa il codice rifiuta, `docs/ARCHITECTURE.md` descrive la canonicalizzazione (inline, devirtualizzazione, funzioni costanti, matmul2d, ABI degli argument buffer).
+- Utile come **banco di prova sull'host**: la validazione esegue gli stessi casi su Metal e su Vulkan e confronta i risultati; un'idea simile (golden dai Mac con GPU Metal) vale per i test di Chlorophyll.
+- **Non sblocca il blocco di oggi**: il traduttore e il runtime presuppongono un driver Vulkan funzionante; su surya manca ancora il CP che scrive in memoria.
+
+**Prossimi passi proposti:** leggere `docs/ARCHITECTURE.md` e `docs/METAL-COVERAGE.md` (fatto solo il README), confrontare le lacune di Chlorophyll con quella tabella, e rinviare qualsiasi integrazione a dopo il primo comando CP riuscito.
