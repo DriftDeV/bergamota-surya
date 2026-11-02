@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2364 @@
+@@ -0,0 +1,2370 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -2060,8 +2060,9 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	volatile uint32_t *memwr = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_MEMWR);
 +	volatile uint32_t *ts = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_TS);
 +	const uint32_t memval = 0x5ee70001u, seq = 0x600d0001u;
-+	uint32_t nots = 0;
++	uint32_t nots = 0, nomw = 0;
 +	PE_parse_boot_argn("sweetgpunots", &nots, sizeof(nots));   /* Run B: skip CACHE_FLUSH_TS */
++	PE_parse_boot_argn("sweetgpunomw", &nomw, sizeof(nomw));   /* Run C: skip CP_MEM_WRITE */
 +	cp_diag(gpu, "before CP_SET_SECURE_MODE");
 +	cp_ring_emit(cp_pkt7(CP_SET_SECURE_MODE, 1));
 +	cp_ring_emit(0);
@@ -2080,12 +2081,17 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	cp_ring_flush(gpu);
 +	bool idle = cp_ring_wait_idle(gpu, "CP_NOP");
 +	cp_status_line(gpu, "after CP_NOP");
++	if (nomw) {
++		printf("SWEET GPU: CP CP_MEM_WRITE skipped (sweetgpunomw=1)\n");
++		sweet_log_sync();
++	} else {
 +	cp_ring_emit(cp_pkt7(CP_MEM_WRITE, 3));
 +	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_MEMWR));
 +	cp_ring_emit(0);
 +	cp_ring_emit(memval);
 +	cp_ring_flush(gpu);
 +	idle = cp_ring_wait_idle(gpu, "CP_MEM_WRITE") && idle;
++	}
 +	cp_status_line(gpu, "after CP_MEM_WRITE");
 +	cp_diag(gpu, "after CP_MEM_WRITE");
 +	if (nots) {
@@ -2100,7 +2106,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	cp_ring_flush(gpu);
 +	idle = cp_ring_wait_idle(gpu, "CACHE_FLUSH_TS") && idle;
 +	}
-+	for (unsigned i = 0; i < 50000 && (*memwr != memval || (!nots && *ts != seq)); i++) {
++	for (unsigned i = 0; i < 50000 && ((!nomw && *memwr != memval) || (!nots && *ts != seq)); i++) {
 +		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
 +		delay(1);
 +	}
@@ -2109,7 +2115,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	cp_status_line(gpu, "after NOP submission");
 +	cp_diag(gpu, "after the test");
 +	gpu_smmu_cb_faults();
-+	bool ok = idle && *memwr == memval && (nots || *ts == seq);
++	bool ok = idle && (nomw || *memwr == memval) && (nots || *ts == seq);
 +	printf("SWEET GPU: CP NOP test %s\n", ok ? "PASSED: the CP fetched, executed and wrote back through the GPU SMMU" : "FAILED");
 +	sweet_log_sync();
 +	return ok;
