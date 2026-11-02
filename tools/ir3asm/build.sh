@@ -61,7 +61,5 @@ PY
 (cd "$W/src/src/freedreno/registers" && for x in a6xx:a6xx.xml adreno_pm4:pm4.xml a6xx_descriptors:desc.xml a6xx_enums:enums.xml; do
    "$W/venv/bin/python" gen_header.py --rnn . --xml adreno/${x%%:*}.xml c-defines > "$W/${x##*:}.h"; done
  for x in adreno_common a7xx_enums a8xx_enums; do "$W/venv/bin/python" gen_header.py --rnn . --xml adreno/$x.xml c-defines > "$W/$x.h"; done)
-mv "$W/a6xx.xml.h" "$W/a6xx.xml.h.bak" 2>/dev/null || true
-cp "$W/a6xx.xml.h.bak" "$W/a6xx.xml.h" 2>/dev/null || true
 cp "$ROOT/tools/ir3asm/csgen.c" "$W/csgen.c"
 (cd "$W" && cc -w -o csgen csgen.c) && echo "built $W/csgen"
