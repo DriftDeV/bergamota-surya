@@ -4,7 +4,7 @@ Aggiornato il 2026-11-02. Ordine indicativo, non promesse di date. Stato attuale
 Ogni scrittura sul telefono (`userdata`, `boot`, GPT) richiede l'OK esplicito dell'utente.
 
 ## 1. GPU Adreno 618: dal primo comando al rendering (priorità attuale)
-1. **Tenere acceso GPU e zap dopo il test** (oggi il test fa `SHUTDOWN` e porta la GPU in slumber): GMU keep-alive, OOB GPU tenuto, zap in esecuzione, come fa il patch 0180 sul Poco F1. Verifica: due esecuzioni consecutive del test dello stesso CP, nessun reset, uptime lungo.
+1. ~~Tenere acceso GPU e zap dopo il test~~ **fatto il 2026-11-02** (`sweetgpukeep=1`: sei giri consecutivi passati, nessun reset). Resta da fare lo stato permanente, senza spegnimento dopo sei giri, quando serviranno carichi di lavoro continui.
 2. **Primo buffer di comandi reale**: un indirect buffer con un calcolo o un disegno semplice, e lettura del risultato dalla memoria.
 3. **Client kernel con ioctl nella forma di `msm`** (modello patch 0182/`SweetAdreno630`): memoria GPU (GEM e IOVA tramite SMMU), sottomissione di buffer di comandi, fence, mappature per processo.
 4. **Userland**: Mesa Turnip con la voce a618 (da verificare nel Mesa 26.2.5 usato dal progetto), poi Chlorophyll (Metal su Turnip, già in esecuzione sul Poco F1) adattato alla a618: GMEM da 512 KiB, `highest_bank_bit` 14, tabella `hwcg`.
