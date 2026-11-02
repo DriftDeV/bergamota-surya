@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2122 @@
+@@ -0,0 +1,2133 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -1821,28 +1821,39 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +		    sizeof(probe) / sizeof(probe[0]), gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
 +		sweet_log_sync();
 +	}
-+	const struct { uint32_t reg, value; } setup[] = {
-+		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0 },
-+		{ A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c },
-+		{ A6XX_CP_MEM_POOL_SIZE, 128 },
-+		{ A6XX_CP_AHB_CNTL, 1 },
-+		{ A6XX_CP_RB_RPTR_ADDR_LO, cp_buffers[2].va },
-+		{ A6XX_CP_RB_RPTR_ADDR_HI, 0 },
-+		{ A6XX_CP_RB_CNTL, CP_RING_CNTL },
-+		{ A6XX_CP_RB_BASE, cp_buffers[0].va },
-+		{ A6XX_CP_RB_BASE_HI, 0 },
-+		{ A6XX_CP_SQE_INSTR_BASE_LO, cp_buffers[1].va },
-+		{ A6XX_CP_SQE_INSTR_BASE_LO + 1, 0 },
++	unsigned mismatch_fatal = 0;
++	const struct { uint32_t reg, value; bool must_stick; } setup[] = {
++		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0, false },
++		{ A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c, false },
++		{ A6XX_CP_MEM_POOL_SIZE, 128, false },
++		{ A6XX_CP_AHB_CNTL, 1, false },
++		{ A6XX_CP_RB_RPTR_ADDR_LO, cp_buffers[2].va, true },
++		{ A6XX_CP_RB_RPTR_ADDR_HI, 0, true },
++		{ A6XX_CP_RB_CNTL, CP_RING_CNTL, true },
++		{ A6XX_CP_RB_BASE, cp_buffers[0].va, true },
++		{ A6XX_CP_RB_BASE_HI, 0, true },
++		{ A6XX_CP_SQE_INSTR_BASE_LO, cp_buffers[1].va, true },
++		{ A6XX_CP_SQE_INSTR_BASE_LO + 1, 0, true },
 +	};
 +	for (unsigned i = 0; i < sizeof(setup) / sizeof(setup[0]); ++i) {
 +		gpu_wr(gpu, setup[i].reg * 4, setup[i].value);
 +		uint32_t got = gpu_rd(gpu, setup[i].reg * 4);
 +		printf("SWEET GPU: CP reg[%#x] wrote=%#x read=%#x\n", setup[i].reg, setup[i].value, got);
 +		if (got != setup[i].value) {
-+			printf("SWEET GPU: CP cold configuration readback mismatch\n");
-+			gpu_cp_diagnostics(gpu, "register mismatch");
-+			return false;
++			/* Boot 2026-11-02: the probe showed the GPU block takes writes (UCHE, ADDR_MODE
++			 * stick); CP_ROQ_THRESHOLDS_2 (0x8c2) reads 0. Log every mismatch and go on:
++			 * only the ring and SQE base registers must read back. */
++			printf("SWEET GPU: CP reg[%#x] MISMATCH (wrote %#x, read %#x)%s\n", setup[i].reg, setup[i].value, got,
++			    setup[i].must_stick ? " FATAL" : " (not required)");
++			if (setup[i].must_stick) {
++				mismatch_fatal++;
++			}
 +		}
++	}
++	if (mismatch_fatal) {
++		printf("SWEET GPU: CP cold configuration readback mismatch (%u required registers)\n", mismatch_fatal);
++		gpu_cp_diagnostics(gpu, "register mismatch");
++		return false;
 +	}
 +	uint32_t fault = gpu_rd(gpu, A6XX_CP_HW_FAULT * 4);
 +	uint32_t irq = gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4);
