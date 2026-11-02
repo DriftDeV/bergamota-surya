@@ -6,6 +6,9 @@ on:
       macos_version:
         description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era; 26.5 = xnu-12377.121.6 / iOS 26.5 era)
         default: "15.3"
+      runner:
+        description: Runner label override (empty = automatic). The macos-15 arm64 pool is often full; macos-15-intel (x64) or macos-14 (arm64, deprecated) also ship Xcode 16.2
+        default: ""
       xcode_version:
         description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x, 26.1 for 26.x)
         default: ""
@@ -60,7 +63,7 @@ jobs:
     # (Xcode 16's iig emits IORPC.kernelContent, which that xnu lacks).
     # 15.x sources (xnu-11215): macos-15 with Xcode 16.2 (the macOS 15.2/15.3 era toolchain).
     # 26.x sources (xnu-12377): macos-26 with Xcode 26.1 (what dxb's own CI builds 26.5 with).
-    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && 'macos-26' || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14') }}
+    runs-on: ${{ inputs.runner || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && 'macos-26' || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14')) }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
