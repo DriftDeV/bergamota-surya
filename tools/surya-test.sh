@@ -10,6 +10,13 @@ IMG=${1:?image}; NAME=${2:?log name}; SECS=${3:-300}
 cd "$(dirname "$0")/.." || exit 1
 LOG=logs/$NAME.txt
 mkdir -p logs
+# The phone may still be running iOS from the previous test: reboot it over SSH so it comes back in Bergamota fastboot.
+if [ -z "$(fastboot devices)" ] && ping -c1 -t2 192.168.7.2 >/dev/null 2>&1; then
+	echo "iOS answers on 192.168.7.2 and no fastboot device: rebooting it over SSH"
+	ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		root@192.168.7.2 '/sbin/reboot || /usr/sbin/reboot || reboot' >/dev/null 2>&1 || true
+	sleep 8
+fi
 echo "waiting for a fastboot device..."
 for i in $(seq 1 120); do
 	DEV=$(fastboot devices | awk 'NR==1{print $1}')
