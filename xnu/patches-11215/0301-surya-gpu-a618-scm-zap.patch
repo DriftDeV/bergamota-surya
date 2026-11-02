@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2133 @@
+@@ -0,0 +1,2292 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -508,6 +508,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
 +extern bool sweet_scm_gpu_zap_test(void);   /* sweet_scm.c */
++extern bool (*sweet_scm_zap_running_hook)(void);   /* sweet_scm.c: called while the zap runs */
 +extern void sweet_scm_probe(void);            /* sweet_scm.c, boot-arg sweetscm=1..4 */
 +extern void sweet_log_sync(void);       /* sweet_ufs.c */
 +extern int sweet_rpmh_arc_levels(const char *res, uint16_t *vals, unsigned max,
@@ -1897,6 +1898,151 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	return ok;
 +}
 +/* End post-PAS CP comparison. */
++/*
++ * sweetgpu=10: start the CP and run a first command stream (Linux a6xx_hw_init order, as
++ * the working A630 bring-up 0103 gpu_cp_start/gpu_cp_nop_test): SQE_CNTL=1, CP_ME_INIT,
++ * then (zap authenticated) CP_SET_SECURE_MODE 0, a NOP, a CP_MEM_WRITE and a
++ * CACHE_FLUSH_TS timestamp, both read back from the scratch buffer. SECVID registers are
++ * never touched. Boot 2026-11-02 showed the register block takes writes; this is the
++ * first time this tree asks the CP to execute.
++ */
++#define CP_NOP                  16
++#define CP_ME_INIT              72
++#define CP_MEM_WRITE            61
++#define CP_EVENT_WRITE          70
++#define CP_SET_SECURE_MODE      102
++#define CACHE_FLUSH_TS          4
++#define CP_EVENT_WRITE_IRQ      0x80000000u
++#define CP_RING_OFF             0x04000u
++#define CP_RING_BYTES           0x8000u
++#define CP_SCRATCH_OFF          0x14000u
++#define CP_SCRATCH_VA           0x40020000u
++#define CP_SCRATCH_MEMWR        0x100u
++#define CP_SCRATCH_TS           0x110u
++static unsigned cp_ring_wptr;   /* dwords */
++
++static uint32_t
++cp_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++cp_pkt7(unsigned opcode, unsigned cnt)
++{
++	return 0x70000000u | cnt | (cp_parity(cnt) << 15) | ((opcode & 0x7fu) << 16) | (cp_parity(opcode) << 23);
++}
++
++static void
++cp_ring_emit(uint32_t v)
++{
++	*(volatile uint32_t *)(cp_memory + CP_RING_OFF + 4u * cp_ring_wptr) = v;
++	cp_ring_wptr = (cp_ring_wptr + 1) % (CP_RING_BYTES / 4);
++}
++
++static void
++cp_ring_flush(vm_offset_t gpu)
++{
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_RING_OFF), CP_RING_BYTES, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gpu_wr(gpu, A6XX_CP_RB_WPTR * 4, cp_ring_wptr);
++}
++
++static void
++cp_status_line(vm_offset_t gpu, const char *when)
++{
++	printf("SWEET GPU: CP %s: SQE_CNTL %#x RPTR %u WPTR %u HW_FAULT %#x CP_IRQ %#x PROTECT %#x CP_STATUS_1 %#x RBBM_STATUS %#x RBBM_IRQ %#x\n",
++	    when, gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(gpu, A6XX_CP_RB_WPTR * 4),
++	    gpu_rd(gpu, A6XX_CP_HW_FAULT * 4), gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(gpu, A6XX_CP_PROTECT_STATUS * 4),
++	    gpu_rd(gpu, A6XX_CP_STATUS_1 * 4), gpu_rd(gpu, A6XX_RBBM_STATUS * 4), gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	sweet_log_sync();
++}
++
++static bool
++cp_ring_wait_idle(vm_offset_t gpu, const char *what)
++{
++	for (unsigned i = 0; i < 100000; i++) {
++		if (gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) == cp_ring_wptr) {
++			printf("SWEET GPU: CP %s: ring idle (RPTR=WPTR=%u) RBBM_STATUS %#x\n", what, cp_ring_wptr,
++			    gpu_rd(gpu, A6XX_RBBM_STATUS * 4));
++			sweet_log_sync();
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: CP %s: ring did NOT drain\n", what);
++	cp_status_line(gpu, "after timeout");
++	return false;
++}
++
++/* SQE_CNTL 0 -> 1 (the only value Linux writes), then a6xx_cp_init's CP_ME_INIT. */
++static bool
++gpu_cp_start(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	cp_ring_wptr = 0;
++	gpu_wr(gpu, A6XX_CP_SQE_CNTL * 4, 1);
++	cp_status_line(gpu, "SQE enabled");
++	cp_ring_emit(cp_pkt7(CP_ME_INIT, 8));
++	cp_ring_emit(0x0000002f);
++	cp_ring_emit(0x00000003);
++	cp_ring_emit(0x20000000);
++	for (unsigned i = 0; i < 5; i++) {
++		cp_ring_emit(0);
++	}
++	cp_ring_flush(gpu);
++	return cp_ring_wait_idle(gpu, "CP_ME_INIT");
++}
++
++/* Runs between the zap's AUTH_AND_RESET and its SHUTDOWN (sweet_scm.c hook). */
++static bool
++gpu_cp_secure_nop(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	volatile uint32_t *memwr = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_MEMWR);
++	volatile uint32_t *ts = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_TS);
++	const uint32_t memval = 0x5ee70001u, seq = 0x600d0001u;
++	cp_ring_emit(cp_pkt7(CP_SET_SECURE_MODE, 1));
++	cp_ring_emit(0);
++	cp_ring_flush(gpu);
++	if (!cp_ring_wait_idle(gpu, "CP_SET_SECURE_MODE 0")) {
++		return false;
++	}
++	*memwr = 0;
++	*ts = 0;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++	cp_ring_emit(cp_pkt7(CP_NOP, 1));
++	cp_ring_emit(0);
++	cp_ring_emit(cp_pkt7(CP_MEM_WRITE, 3));
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_MEMWR));
++	cp_ring_emit(0);
++	cp_ring_emit(memval);
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 4));
++	cp_ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_TS));
++	cp_ring_emit(0);
++	cp_ring_emit(seq);
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "NOP submission");
++	for (unsigned i = 0; i < 50000 && (*memwr != memval || *ts != seq); i++) {
++		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++		delay(1);
++	}
++	printf("SWEET GPU: CP NOP test: CP_MEM_WRITE read back %#010x (want %#010x), CACHE_FLUSH_TS timestamp %#010x (want %#010x), RBBM_INT_0_STATUS %#x\n",
++	    *memwr, memval, *ts, seq, gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	cp_status_line(gpu, "after NOP submission");
++	bool ok = idle && *memwr == memval && *ts == seq;
++	printf("SWEET GPU: CP NOP test %s\n", ok ? "PASSED: the CP fetched, executed and wrote back through the GPU SMMU" : "FAILED");
++	sweet_log_sync();
++	return ok;
++}
++
 +
 +static void
 +gpu_smmu_cb_faults(void)
@@ -2324,7 +2470,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 + * boot OOB as a successful start does, and send the GPU to slumber.
 + */
 +static bool
-+gpu_gx_test(bool zap, bool cp)
++gpu_gx_test(bool zap, bool cp, bool run)
 +{
 +	uint32_t gx_gdscr;
 +
@@ -2343,7 +2489,13 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +				sweet_log_sync();
 +				return false;
 +			}
++			if (run && !gpu_cp_start()) {
++				printf("SWEET GPU: CP start failed; retaining GX/GMU until reset\n");
++				sweet_log_sync();
++				return false;
++			}
 +		}
++		sweet_scm_zap_running_hook = (run && cp) ? gpu_cp_secure_nop : NULL;
 +		if (zap) {
 +			if (!(gx_gdscr & GDSC_PWR_ON)) {
 +				printf("SWEET GPU: zap skipped: GX not powered\n");
@@ -2354,7 +2506,14 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +				return false;
 +			}
 +		}
-+		if (cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_post_pas_check()) {
++		if (run && cp) {
++			/* back to the state the next run expects: SQE stopped */
++			vm_offset_t g = ml_io_map(GPU_PA, GPU_SIZE);
++			if (g) {
++				gpu_wr(g, A6XX_CP_SQE_CNTL * 4, 0);
++			}
++		}
++		if (!run && cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_post_pas_check()) {
 +			printf("SWEET GPU: CP post-PAS state changed; retaining GX/GMU until reset\n");
 +			sweet_log_sync();
 +			return false;
@@ -2513,7 +2672,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +			gx = rail && gpu_sptprac(true);
 +		}
 +		if (booted && (mode < 6 || gx) && gpu_hfi_start() && mode >= 6) {
-+			if (!gpu_gx_test(mode >= 7, mode >= 9)) {
++			if (!gpu_gx_test(mode >= 7, mode >= 9, mode >= 10)) {
 +				return;
 +			}
 +		} else if (rail) {
@@ -2573,7 +2732,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_scm.c
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,362 @@
 +/*
 + * SWEET: Qualcomm SCM availability queries, opt-in with sweetscm=1.
 + *
@@ -2782,6 +2941,8 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	return (int32_t)r.a[0] == 0 && (int32_t)r.a[1] == 0 ? ZAP_OK : ZAP_ERROR;
 +}
 +
++bool (*sweet_scm_zap_running_hook)(void);   /* set by sweet_gpu.c for sweetgpu=10 */
++
 +/* Return true only if PAS never started or a completed shutdown quiesced it. */
 +bool
 +sweet_scm_gpu_zap_test(void)
@@ -2840,6 +3001,9 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +		if (result == ZAP_OK) {
 +			printf("SWEET SCM: signed zap authenticated and started\n");
 +			sweet_log_sync();
++			if (sweet_scm_zap_running_hook) {
++				(void)sweet_scm_zap_running_hook();
++			}
 +		}
 +	}
 +	/* An unfinished secure operation gets no new calls, frees, or collapse. */
