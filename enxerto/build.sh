@@ -42,6 +42,9 @@ case ${BERGAMOTA:-} in
 1) CMDLINE="$CMDLINE bergamota.fastboot=1" ;;
 0) CMDLINE="$CMDLINE bergamota.fastboot=0" ;;
 esac
+# CHARGE=0 adds bergamota.charge=0: the off-mode charging screen never takes over, even when ABL appends
+# androidboot.mode=charger (a RAM boot right after a USB power-on does that). Use it for test images.
+[ "${CHARGE:-}" != 0 ] || CMDLINE="$CMDLINE bergamota.charge=0"
 SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
 OBJS=""
 for f in $SRCS; do
