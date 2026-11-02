@@ -134,6 +134,30 @@ Un driver Metal per iOS 16 sarebbe nuovo (dimensione grande) [I].
 * **Mesa (freedreno/turnip), Linux `a6xx`/`msm`:** ordine di `a6xx_hw_init`, quirk A618 (`a618`), GBIF.
 * **Lavoro altrui su Poco X3 (surya):** `arbuxiktech/iOS-on-surya` è fermo e senza lavoro proprio; nessun A618 funzionante noto [V, censimento del 2026-11-02].
 
+### 5.1 Riferimento: Snapintosh (macOS 27 su Snapdragon X2 Elite, Adreno X2-90)
+
+Segnalato dall'utente il 2026-11-02. Progetto di terzi, non un fork di Bergamota: **riferimento di lettura, nessun codice copiato** finché non decidiamo cosa riusare e con quale attribuzione. Censimento fatto con `gh api` in sola lettura [V: README e licenze dei repo].
+
+| Componente | Cosa fa | Licenza | Rilevanza per noi |
+|---|---|---|---|
+| `Snapintosh/SnapMetal` (`AdrenoMetal.bundle`) | Driver Metal come plug-in: device, command buffer, encoder, comandi PM4 Adreno scritti a mano, parla con la kext via IOGPU. Include harness che esegue il plug-in contro il Metal del Mac host per confronto | MIT [V] | Alta come riferimento di architettura: Metal→Adreno senza Mesa, come `hakios-metal`, ma su una GPU Qualcomm e su un sistema Apple vero |
+| `Snapintosh/air2ir3` | Compilatore AIR (IR di Metal) → ir3 (IR di Mesa per Adreno) | MIT [V] | Alta: stessa funzione del nostro `libbgair` (AIR→NIR→ir3) in Chlorophyll; utile per confrontare copertura delle istruzioni AIR e tempi di traduzione |
+| `Snapintosh/SnapAdreno` (AdrenoX2 + AdrenoDisplay) | Kext IOGPU e display per l'Adreno X2-90 | MIT [V] | Media: mostra come si espone una GPU Adreno all'IOGPU/Metal di Apple, ma su famiglia a8xx |
+| `Snapintosh/Snapintosh` (ombrello) | Monitor EL2 (SPTM/TXM, tabelle a 16 KiB), tool, docs | MIT con componenti GPL-2.0 (`NOASSERTION` su GitHub) [V] | Bassa: l'hypervisor non ci serve |
+
+**Perché è pertinente [I].** Apple riusa il modello Metal/IOGPU tra macOS e iOS, quindi un driver Metal per Adreno scritto per macOS è concettualmente vicino a quello che ci serve su iOS (oggi coperto da Chlorophyll = Metal su Vulkan/Turnip, `gpu/metal`, `gpu/freedreno-sweet`).
+
+**Limiti [V/I].**
+* GPU di generazione diversa: l'X2-90 è a8xx, la nostra A618 è a6xx. Registri, tabelle e parte dei pacchetti PM4 cambiano; ir3 e le basi di PM4 sono comuni [I].
+* È pensato per macOS 27: il caricamento del bundle e il servizio IOKit non sono quelli di iOS, dove oggi iniettiamo il driver con `bgi.dylib` [I].
+* Nessun esito per l'audio, la camera e il Bluetooth: il loro README li dà "non supportati" [V].
+* Nessuna prova che giri sulla nostra GPU: il blocco di base resta far eseguire un comando al CP dell'A618 (sezione 2).
+
+**Uso previsto, a fasi.**
+1. Leggere SnapMetal e air2ir3 per confrontare: come costruiscono i command buffer PM4, come mappano le risorse, copertura AIR, caching dei shader.
+2. Se il nostro traduttore AIR dà problemi di copertura o di lentezza (vedi le note sui 40 s al primo frame in `NOTES.md`), valutare `air2ir3` come alternativa o come fonte di patch, con attribuzione MIT.
+3. Solo dopo che l'A618 esegue un comando e il client IOKit funziona (fasi 2-3 della sezione 3): valutare di riusare parti di SnapMetal per un percorso Metal diretto, senza Vulkan.
+
 ## 6. Domande aperte / prossimi passi
 
 1. Esito della sonda sul telefono (`sweetgpu=9 sweetscm=4`): quale riga della matrice 2.3?
