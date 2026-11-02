@@ -123,6 +123,24 @@ Fino a quando non si sceglie, il ripiego semplice resta lo scambio di `boot` dal
 - Gli aggiornamenti OTA di Android non funzionano più (`boot` non è suo).
 - Il dual boot è indipendente dal supporto di Wi-Fi, audio o GPU in iOS.
 
+## 6b. Riferimento esistente: guida Windows su Poco X3 Pro (woa-vayu, n00b69)
+
+Fonti lette il 2026-11-02: `github.com/n00b69/woa-vayu` (guide `1-partition.md`, `4-dualboot.md`, `dualboot.md`, `edl.md`; 63 stelle, nessuna licenza) e il codice Kotlin di `github.com/n00b69/woa-helper` (app per il cambio di sistema; nessuna licenza). Sono guide e codice di terzi: solo fatti e metodo, niente copia. Esiste anche una variante per il Poco X3 NFC, che qui non ho letto.
+
+**Come fanno il dual boot Android + Windows** [fatto]:
+- **Il cambio di sistema è uno scambio della partizione `boot`.** Da Android, con root, l'app fa un backup del `boot.img` di Android e poi `dd` dell'immagine UEFI su `/dev/block/bootdevice/by-name/boot` e riavvia ("QUICKBOOT TO WINDOWS"). Da Windows un programma (`sta.exe`) riscrive il `boot.img` Android salvato in `C:\` e riavvia. Non c'è un selettore all'avvio: vale l'ultima immagine scritta in `boot`. È la nostra **opzione B** (scambio di `boot`), già usata in pratica.
+- **Partizionamento:** da un TWRP modificato, `sgdisk --resize-table 64` sul LUN `sda`, poi `parted`: si cancella `userdata` (nel loro caso la 32), la si ricrea più corta, e si aggiungono dopo `esp` (FAT32, 0,3 GB, flag `esp`) e `win` (NTFS, fino a fine disco). Poi si formatta `data` da TWRP e si lancia uno script `fixgpt` ("altrimenti Windows può rompere il dispositivo": Windows riscrive la GPT a modo suo). È lo stesso schema del nostro layout (`userdata` ridotta, nuove partizioni dopo, nulla spostato), quindi la procedura è nota per questa famiglia di telefoni.
+- **Ogni sistema vede tutte le partizioni** nella GPT: non c'è isolamento fisico, come già avevo ipotizzato nella sezione 4.5.
+- Il firmware deve essere recente per l'UEFI; non riguarda iOS.
+
+**Cosa ci dice sul rischio** [fatto]: la guida avverte "tutti i dati verranno cancellati", "non eseguire due volte lo stesso comando", "non riavviare se pensi di aver sbagliato" e include una guida di recupero in EDL (`edl.md`). Il recupero in EDL sul Poco X3 Pro richiede lo strumento di autenticazione MiFlash HXRU a pagamento (circa 3 dollari in crediti) oppure cortocircuitare i punti di test; con il bootloader sbloccato e il fastboot raggiungibile basta `fastboot oem edl`. Conferma quanto dubitavo nella sezione 6: l'EDL non è gratuito né sicuro, quindi la GPT va toccata solo con tutte le regole di quella sezione.
+
+**Cosa riusare per noi:**
+1. La variante senza GPT (sezione 6) per iniziare, come deciso dall'utente.
+2. Lo scambio di `boot` con backup automatico dell'altra immagine come primo vero dual boot, prima del selettore in Enxerto.
+3. Il selettore in Enxerto resta il miglioramento: nessun `dd` da root a ogni cambio, e il cambio funziona anche se Android non parte.
+4. Se un giorno si toccherà la GPT: stessa sequenza (backup, `--dry-run`, un solo comando alla volta, controllo CRC, copia secondaria).
+
 ## 7. Ordine di lavoro suggerito
 
 1. Decidere le dimensioni definitive (sezione 3) e il sistema predefinito.
