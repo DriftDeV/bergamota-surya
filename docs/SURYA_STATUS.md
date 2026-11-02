@@ -37,6 +37,8 @@ Dettagli cronologici e log: `NOTES.md`. Piano di quanto resta: `docs/SURYA_ROADM
 - **[fatto]** Errori precedenti spiegati a posteriori: `CP_IRQ 0x80` (illegal instruction), scritture che non arrivavano e i reset senza panic erano legati allo zap in RAM non riservata (ipotesi molto probabile).
 - Documenti: `docs/gpu.md` (sezioni 5.1 Snapintosh, 5.2 piano di debug, 5.3 postmarketOS, 5.4 metal2vulkan).
 
+- **[fatto, 2026-11-02] Riavvio da iOS su surya** (patch 0318, CI 41474418738, immagine `enxerto-boot-ios18-reboot.img`): `ssh root@192.168.7.2 sweetreboot normal` fa rientrare il telefono in Bergamota fastboot da solo in circa 15 s, senza tasti (IMEM `0x146aa65c` + `PSCI SYSTEM_RESET`, nessun `PS_HOLD`/PMIC). `tools/surya-test.sh` lo usa quando iOS è ancora acceso.
+
 ## Documentazione e ricerche prodotte
 - `docs/gpu.md`, `docs/audio.md`, `docs/wifi.md`, `docs/bluetooth.md`, `docs/cameras.md` (stato, piani, rischi per ogni blocco hardware).
 - `docs/dual-boot.md` (idea futura Android + iOS, rischio GPT, variante solo `userdata`, riferimento woa-vayu).

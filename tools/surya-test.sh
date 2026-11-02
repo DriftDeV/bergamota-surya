@@ -10,10 +10,13 @@ IMG=${1:?image}; NAME=${2:?log name}; SECS=${3:-300}
 cd "$(dirname "$0")/.." || exit 1
 LOG=logs/$NAME.txt
 mkdir -p logs
-# If iOS is still up from the previous test there is no fastboot device. `sweetreboot normal` over SSH does NOT work on surya
-# (2026-11-02: the phone hung instead of rebooting: patch 0137 still uses the Poco F1 PS_HOLD/IMEM/PMIC), so just say so.
+# If iOS is still up from the previous test there is no fastboot device: reboot it over SSH. Works since kernel patch 0318
+# (2026-11-02: `sweetreboot normal` -> IMEM + PSCI SYSTEM_RESET -> Enxerto in `boot` -> Bergamota fastboot in ~15 s).
 if [ -z "$(fastboot devices)" ] && ping -c1 -t2 192.168.7.2 >/dev/null 2>&1; then
-	echo "iOS is still running and there is no fastboot device: hold Power for 10-15 s (reboot over SSH is not ported to surya yet)"
+	echo "iOS answers on 192.168.7.2 and no fastboot device: sweetreboot normal over SSH"
+	ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		root@192.168.7.2 'sweetreboot normal' >/dev/null 2>&1 || true
+	sleep 8
 fi
 echo "waiting for a fastboot device..."
 for i in $(seq 1 120); do

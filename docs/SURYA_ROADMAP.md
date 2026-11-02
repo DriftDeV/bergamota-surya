@@ -15,7 +15,7 @@ Ogni scrittura sul telefono (`userdata`, `boot`, GPT) richiede l'OK esplicito de
 ## 2. Versioni di iOS
 - **iOS 26.x** (xnu-12377, `xnu/patches-12377`): la radice è già scaricata in `research/ios26/`; da portare patch e ADT. Poi **iOS 27** per gradini. Ordine scelto dall'utente: 18, poi 26, poi 27.
 - **Display**: eliminare la barra di stato rossa senza passare al 3x (più lento e con layout rotto).
-- **Riavvio da iOS** (**priorità alta**: il 2026-11-02 `sweetreboot normal` via SSH ha lasciato il telefono bloccato invece di riavviarlo, e `/sbin/reboot` non esiste; per ora si esce con Power tenuto 10-15 s) (`sweetreboot fastboot`/`bergamota`): le patch 0137/0140 usano ancora l'IMEM del Poco F1 (`0x146bf65c`) e il PMIC PM8998; per surya l'IMEM è `0x146aa65c`. Da portare con un boot-arg, così `sweetreboot` funziona anche dal sistema acceso.
+- ~~**Riavvio da iOS**~~ **fatto il 2026-11-02** (patch 0318): `sweetreboot normal` via SSH riporta il telefono in Bergamota fastboot da solo. Resta da provare `sweetreboot bergamota` e `fastboot`/`bootloader` (fastboot Xiaomi).
 
 ## 3. Audio, Wi-Fi, Bluetooth, fotocamere (dettagli in `docs/audio.md`, `wifi.md`, `bluetooth.md`, `cameras.md`)
 - **Audio**: codec WCD9375 su SoundWire con macro bolero e amplificatore TAS256x; servono ADSP (PAS), SoundWire e un driver audio iOS. Stima: settimane o mesi.
