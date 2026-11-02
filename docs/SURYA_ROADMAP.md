@@ -38,3 +38,14 @@ Ogni scrittura sul telefono (`userdata`, `boot`, GPT) richiede l'OK esplicito de
 - Cosa fare di `POCO_X3_CAMERE_ISP.md` (sanificare o lasciare fuori).
 - Riabilitare la CI per iOS 16 con la patch opzionale xcode16 (`xnu/optional/0086-xcode16-iig-iorpc.patch`).
 - Dimensioni definitive del dual boot e sistema predefinito.
+
+## 7. Voci tratte da "Bergamota problemi soluzioni repository" (letto il 2026-11-02)
+Il documento (`docs/Bergamota problemi soluzioni repository.md`, scritto dall'utente con una ricerca esterna) è precedente al Run D: le sue ipotesi H-zap e il "Run Z" sono ora confermati (zap nella regione `0x97715000`, `docs/SURYA_STATUS.md`); il "Run D" del documento (bit TIMESTAMP di `CACHE_FLUSH_TS`) non serve più. Restano utili:
+- **Schermata caricatore sul surya** (Enxerto è ora in `boot`, quindi è la prima cosa che si vede dopo certi avvii): legge SID e registri del PMIC del Poco F1 (PMI8998). Sul surya PM6150 sta su SID 0 e PM6150L su SID 4; il fuel gauge è un QG e non un FG gen3; il WLED è WLED5 su SID 4. Non è un guasto: le letture sono corrette su periferiche che qui hanno altri indirizzi. Da fare: tabella per scheda in `enxerto/` (SID, tipo di gauge, tipo di WLED), solo letture, nessuna scrittura sul PMIC finché non si verifica la proprietà EE0 dell'APID.
+- **Regola SMMU/DMA** (già rispettata dal patch 0301): riusare l'SMR esistente, mai duplicarlo; clean/invalidate per VA. Un SMR duplicato o assente può resettare il SoC.
+- **Firmware GMU:** Linux per sm7150 usa `a630_gmu.bin` di linux-firmware; noi usiamo `a618_gmu.bin` del vendor (versione 1.17). Esperimento di costo basso da fare quando serve (run "G" del documento).
+- **`hw_init` completo come Linux** (azzerare `RBBM_SECVID_TSB_*`, `ADDR_MODE_CNTL` anche per SECVID, `RBBM_VBIF_CLIENT_QOS_CNTL=3`, tabella `a615_hwcg`): da fare prima di sottomettere carichi veri. **Non scrivere mai `RBBM_SECVID_TRUST_CNTL`** (violazione XPU possibile).
+- **Fence AHB:** il range `0x802800a0` di Linux contro `0x80a008a0` del downstream A618 (il nostro patch usa quest'ultimo); da verificare solo se compaiono scritture scartate.
+- **Quale xnu per iOS 18.7.x:** `XNU11215_MIGRATION.md` dice che 11215 copre iOS 18.0-18.3 e che 18.7.x è xnu-11417; oggi iOS 18.7.8 gira con xnu-11215. Da valutare il passaggio a 11417 se compaiono incompatibilità.
+- **Licenze:** `ios-sweet` è MIT; `mxtpasontop`, `ios-topaz`, `ios-extra`, `iOS-on-surya` e Bergamota non mostrano licenza. Resta la decisione sul codice A618 derivato da `mxtpasontop` (sezione 6 sopra).
+- **Mesa e a618:** non verificato che il Mesa del progetto abbia una voce per `0x06010800` (punto 1.4 sopra).
