@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2553 @@
+@@ -0,0 +1,2557 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -2679,6 +2679,8 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +#define CP_INDIRECT_BUFFER      63
 +#define CP_REG_TO_MEM           62
 +#define CP_MEMCPY               83
++#define CP_WAIT_MEM_WRITES      18
++#define CP_WAIT_FOR_IDLE        38
 +#define CP_IB_OFF               0x1000u
 +#define CP_IB_MEMWR             0x120u
 +#define CP_IB_REG2MEM           0x130u
@@ -2707,6 +2709,8 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	ib[n++] = (A6XX_CP_RB_BASE) | (1u << 18);
 +	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_REG2MEM);
 +	ib[n++] = 0;
++	ib[n++] = cp_pkt7(CP_WAIT_MEM_WRITES, 0);   /* the MEM_WRITE must land before MEMCPY reads it (run ib: MEMCPY copied 0) */
++	ib[n++] = cp_pkt7(CP_WAIT_FOR_IDLE, 0);
 +	ib[n++] = cp_pkt7(CP_MEMCPY, 5);
 +	ib[n++] = 1;
 +	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMWR);
