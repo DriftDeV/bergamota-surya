@@ -55,3 +55,13 @@ open('../nirstubs.s', 'w').write(''.join('.globl %s\n.zerofill __DATA,__bss,%s,6
 subprocess.run(['cc'] + keep + ['-w', '../ir3asm.c', '../nirstubs.s', '-o', '../ir3asm'] + libs + ['-lz', '-lm', '-lc++'], check=True)
 print('built', os.path.join(w, 'ir3asm'), 'with', len(syms), 'NIR stubs')
 PY
+
+# csgen: host-side generator of the compute dispatch command stream (kernel patch 0301 embeds its output).
+#   research/mesa-ir3/csgen INSTRLEN first_store_a618.bin > cs_out.h
+(cd "$W/src/src/freedreno/registers" && for x in a6xx:a6xx.xml adreno_pm4:pm4.xml a6xx_descriptors:desc.xml a6xx_enums:enums.xml; do
+   "$W/venv/bin/python" gen_header.py --rnn . --xml adreno/${x%%:*}.xml c-defines > "$W/${x##*:}.h"; done
+ for x in adreno_common a7xx_enums a8xx_enums; do "$W/venv/bin/python" gen_header.py --rnn . --xml adreno/$x.xml c-defines > "$W/$x.h"; done)
+mv "$W/a6xx.xml.h" "$W/a6xx.xml.h.bak" 2>/dev/null || true
+cp "$W/a6xx.xml.h.bak" "$W/a6xx.xml.h" 2>/dev/null || true
+cp "$ROOT/tools/ir3asm/csgen.c" "$W/csgen.c"
+(cd "$W" && cc -w -o csgen csgen.c) && echo "built $W/csgen"
