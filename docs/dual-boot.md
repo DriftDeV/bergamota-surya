@@ -13,18 +13,35 @@ Fattibile, con lavoro medio. Tre pezzi:
 | Far partire iOS dalla sua partizione | bassa | oggi iOS usa tutta `userdata` |
 | Far partire Android quando lo si sceglie | **la parte incerta** | Enxerto è in `boot`, Android non parte da solo |
 
-## 2. Spazio: 64 + 64 GB non entrano
+## 2. Spazio: 64 + 64 non entrano, anche ridimensionando le altre partizioni
 
-- `userdata` misura 112 556 126 208 byte, cioè **104,8 GiB** [fatto]. Il telefono è il modello 128 GB: il resto è occupato dalle partizioni di sistema.
-- Quindi non sono possibili due partizioni da 64 GiB. Proposta: **iOS 56 GiB + Android 48 GiB** (o 50/50), da decidere. La radice iOS attuale è un'immagine di circa 20 GiB [fatto], quindi per iOS bastano anche 40 GiB.
-- Ridurre una f2fs esistente non conviene: dopo la divisione Android riformatta la sua parte (i dati Android sono già persi dal 2026-11-01).
+Letto dalla GPT del LUN 0 (`backup/surya/lun-sda-head1M.img`, settore da 4096 byte, 16 partizioni) [fatto]:
+
+| Partizione | Dimensione | Nota |
+|---|---|---|
+| `userdata` | 104,83 GiB | dati Android, oggi radice iOS |
+| `super` | 8,00 GiB | sistema Android (system, vendor, product): serve ad Android |
+| `cust` | 1,00 GiB | Xiaomi |
+| `cache` | 0,38 GiB | |
+| `exaid` | 0,38 GiB | |
+| `recovery` | 0,125 GiB | OrangeFox, da tenere |
+| `minidump` | 0,125 GiB | |
+| altre 8 (`persist`, `misc`, `keystore`, `frp`, `vbmeta_system`, `metadata`, `gsort`, `ffu`) | circa 0,1 GiB in tutto | |
+| **Totale LUN 0** | **114,90 GiB** | tutto lo spazio utilizzabile del LUN |
+
+- Il disco è il modello da 128 GB: 114,9 GiB sul LUN 0. Gli altri LUN (sdb-sdf: bootloader, modem, firmware) sono piccoli e non riutilizzabili [fatto].
+- Hai ragione che `userdata` è solo una parte, ma il resto del LUN 0 vale circa **10 GiB**, e quasi tutto è `super`, che Android richiede. Ridimensionare le altre partizioni recupera al massimo 1-2 GiB (`cache`, `exaid`, `minidump`, parte di `cust`).
+- Quindi **64 GiB per iOS** lascia ad Android **circa 51 GiB in tutto**: 8 GiB di `super`, 1 GiB di `cust`, il resto piccolo e circa **40 GiB di dati**. Una divisione alla pari sarebbe circa 55 GiB per parte.
+- Con "64 GB" decimali (59,6 GiB) per sistema, la somma è 119 GiB, comunque oltre i 114,9 disponibili.
+- Per arrivare a 64 e 64 servirebbe un disco più grande, oppure scegliere cosa tagliare (per esempio Android senza `cust`, molto rischioso e da non fare).
+- Ridurre una f2fs esistente non conviene: dopo la divisione Android riformatta la sua parte (i dati Android sono già persi dal 2026-11-01). La radice iOS attuale è un'immagine di circa 20 GiB [fatto], quindi 64 GiB per iOS sono comodi, non indispensabili.
 
 ## 3. Layout proposto
 
 Oggi: una sola partizione `userdata` (sda16, LUN 0) [fatto]. Il piano:
 
 1. `userdata` resta il nome della partizione Android, ridotta (Android cerca quel nome nel suo fstab) [ipotesi, da verificare nel suo `fstab`].
-2. Una nuova partizione subito dopo, per esempio `iosroot`, per la radice HFS di iOS.
+2. Una nuova partizione subito dopo, per esempio `iosroot` (64 GiB, o quanto deciso al punto 2), per la radice HFS di iOS.
 3. Una partizione piccola (circa 128 MiB) `boot_android` con il `boot.img` Android originale (il backup è in `backup/surya/boot.img`, 128 MiB, checksum verificato [fatto]).
 4. `boot` continua a contenere Enxerto; `recovery`, modem, persist e tutti i backup restano intatti.
 
