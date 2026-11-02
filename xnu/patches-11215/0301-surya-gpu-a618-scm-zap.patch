@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2292 @@
+@@ -0,0 +1,2321 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -1822,6 +1822,27 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +		    sizeof(probe) / sizeof(probe[0]), gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
 +		sweet_log_sync();
 +	}
++	/* The A630 bring-up (0103 gpu_cp_hw_init) writes the UCHE ranges as 64-bit values; the probe above wrote
++	 * only the low words. a618 GMEM is 512 KiB. Read back and log; carry on either way. */
++	{
++		const struct { const char *name; uint32_t reg, lo, hi; } u64[] = {
++			{ "UCHE_WRITE_RANGE_MAX", 0xe05, 0xffffffc0u, 0x0001ffffu },
++			{ "UCHE_TRAP_BASE",       0xe09, 0xfffff000u, 0x0001ffffu },
++			{ "UCHE_WRITE_THRU_BASE", 0xe07, 0xfffff000u, 0x0001ffffu },
++			{ "UCHE_GMEM_RANGE_MIN",  0xe0b, 0x00100000u, 0 },
++			{ "UCHE_GMEM_RANGE_MAX",  0xe0d, 0x00100000u + 0x80000u - 1, 0 },
++		};
++		for (unsigned i = 0; i < sizeof(u64) / sizeof(u64[0]); ++i) {
++			gpu_wr(gpu, u64[i].reg * 4, u64[i].lo);
++			gpu_wr(gpu, (u64[i].reg + 1) * 4, u64[i].hi);
++			uint32_t lo = gpu_rd(gpu, u64[i].reg * 4), hi = gpu_rd(gpu, (u64[i].reg + 1) * 4);
++			printf("SWEET GPU: uche64 %-22s reg=%#x wrote=%#x:%08x read=%#x:%08x %s\n", u64[i].name, u64[i].reg,
++			    u64[i].hi, u64[i].lo, hi, lo, (lo == u64[i].lo && hi == u64[i].hi) ? "STICKS" : "IGNORED");
++		}
++		gpu_wr(gpu, 0xe19 * 4, (1u << 7) | 1);   /* UCHE_CLIENT_PF */
++		printf("SWEET GPU: uche64 UCHE_CLIENT_PF read=%#x\n", gpu_rd(gpu, 0xe19 * 4));
++		sweet_log_sync();
++	}
 +	unsigned mismatch_fatal = 0;
 +	const struct { uint32_t reg, value; bool must_stick; } setup[] = {
 +		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0, false },
@@ -2017,19 +2038,27 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	*memwr = 0;
 +	*ts = 0;
 +	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++	/* One packet at a time: after each, the ring state and CP_INTERRUPT_STATUS say which one the SQE rejects. */
++	cp_status_line(gpu, "before the single packets");
 +	cp_ring_emit(cp_pkt7(CP_NOP, 1));
 +	cp_ring_emit(0);
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "CP_NOP");
++	cp_status_line(gpu, "after CP_NOP");
 +	cp_ring_emit(cp_pkt7(CP_MEM_WRITE, 3));
 +	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_MEMWR));
 +	cp_ring_emit(0);
 +	cp_ring_emit(memval);
++	cp_ring_flush(gpu);
++	idle = cp_ring_wait_idle(gpu, "CP_MEM_WRITE") && idle;
++	cp_status_line(gpu, "after CP_MEM_WRITE");
 +	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 4));
 +	cp_ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
 +	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_TS));
 +	cp_ring_emit(0);
 +	cp_ring_emit(seq);
 +	cp_ring_flush(gpu);
-+	bool idle = cp_ring_wait_idle(gpu, "NOP submission");
++	idle = cp_ring_wait_idle(gpu, "CACHE_FLUSH_TS") && idle;
 +	for (unsigned i = 0; i < 50000 && (*memwr != memval || *ts != seq); i++) {
 +		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
 +		delay(1);
