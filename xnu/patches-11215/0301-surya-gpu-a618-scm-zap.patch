@@ -437,7 +437,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
  bsd/dev/mem.c				standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2479 @@
+@@ -0,0 +1,2553 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -2670,11 +2670,82 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +	return ok;
 +}
 +
++/*
++ * Roadmap step 2: a real indirect buffer. The main ring only holds CP_INDIRECT_BUFFER; the CP fetches the IB through the
++ * GPU SMMU from the scratch page (VA CP_SCRATCH_VA + 0x1000) and runs CP_MEM_WRITE, CP_REG_TO_MEM (reads the CP_RB_BASE
++ * register into memory, known value 0x40000000), CP_MEMCPY (copies the CP_MEM_WRITE result) and CACHE_FLUSH_TS.
++ * CP_MEMCPY (0x53) is the least certain opcode on the a618 SQE: if it is illegal it shows as CP_IRQ 0x80 and its own FAIL.
++ */
++#define CP_INDIRECT_BUFFER      63
++#define CP_REG_TO_MEM           62
++#define CP_MEMCPY               83
++#define CP_IB_OFF               0x1000u
++#define CP_IB_MEMWR             0x120u
++#define CP_IB_REG2MEM           0x130u
++#define CP_IB_MEMCPY            0x140u
++#define CP_IB_TS                0x150u
++
++static bool
++gpu_cp_ib_test(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	volatile uint32_t *ib = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_IB_OFF);
++	volatile uint32_t *res = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF);
++	const uint32_t memval = 0x1b0a0001u, seq = 0x1b0b0001u, regval = 0x40000000u;
++	unsigned n = 0;
++	for (unsigned i = 0; i < 0x40; i++) {
++		res[CP_IB_MEMWR / 4 + i] = 0;
++	}
++	ib[n++] = cp_pkt7(CP_MEM_WRITE, 3);
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMWR);
++	ib[n++] = 0;
++	ib[n++] = memval;
++	ib[n++] = cp_pkt7(CP_REG_TO_MEM, 3);
++	ib[n++] = (A6XX_CP_RB_BASE) | (1u << 18);
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_REG2MEM);
++	ib[n++] = 0;
++	ib[n++] = cp_pkt7(CP_MEMCPY, 5);
++	ib[n++] = 1;
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMWR);
++	ib[n++] = 0;
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMCPY);
++	ib[n++] = 0;
++	ib[n++] = cp_pkt7(CP_EVENT_WRITE, 4);
++	ib[n++] = CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ;
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_TS);
++	ib[n++] = 0;
++	ib[n++] = seq;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x2000, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	cp_ring_emit(cp_pkt7(CP_INDIRECT_BUFFER, 3));
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_IB_OFF));
++	cp_ring_emit(0);
++	cp_ring_emit(n);
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "IB");
++	for (unsigned i = 0; i < 50000 && (res[CP_IB_TS / 4] != seq || res[CP_IB_MEMCPY / 4] != memval); i++) {
++		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++		delay(1);
++	}
++	bool wr = res[CP_IB_MEMWR / 4] == memval, r2m = res[CP_IB_REG2MEM / 4] == regval;
++	bool cpy = res[CP_IB_MEMCPY / 4] == memval, ts = res[CP_IB_TS / 4] == seq;
++	printf("SWEET GPU: IB test %s: MEM_WRITE %s (%#x), REG_TO_MEM %s (%#x want %#x), MEMCPY %s (%#x), CACHE_FLUSH_TS %s (%#x), CP_IRQ %#x, HW_FAULT %#x\n",
++	    (idle && wr && r2m && cpy && ts) ? "PASSED" : "FAILED", wr ? "ok" : "FAIL", res[CP_IB_MEMWR / 4],
++	    r2m ? "ok" : "FAIL", res[CP_IB_REG2MEM / 4], regval, cpy ? "ok" : "FAIL", res[CP_IB_MEMCPY / 4],
++	    ts ? "ok" : "FAIL", res[CP_IB_TS / 4], gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(gpu, A6XX_CP_HW_FAULT * 4));
++	sweet_log_sync();
++	return idle && wr && r2m && cpy && ts;
++}
++
 +static void
 +gpu_keep_thread(void *arg, wait_result_t result)
 +{
 +	const unsigned rounds = 6;
 +	unsigned passed = 0;
++	bool ib_ok = false;
 +	(void)arg;
 +	(void)result;
 +	for (unsigned r = 1; r <= rounds; r++) {
@@ -2682,13 +2753,16 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..9, sweetgpudelay), SCM/
 +		clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);
 +		(void)assert_wait_deadline(&gpu_keep_chan, THREAD_UNINT, deadline);
 +		thread_block(THREAD_CONTINUE_NULL);
++		if (r == 1) {
++			ib_ok = gpu_cp_ib_test();
++		}
 +		if (gpu_cp_repeat(r)) {
 +			passed++;
 +		} else {
 +			break;
 +		}
 +	}
-+	printf("SWEET GPU: KEEP %u of %u rounds passed; shutting the GPU down\n", passed, rounds);
++	printf("SWEET GPU: KEEP %u of %u rounds passed, IB test %s; shutting the GPU down\n", passed, rounds, ib_ok ? "PASSED" : "FAILED");
 +	sweet_log_sync();
 +	bool zap = sweet_scm_zap_shutdown();
 +	vm_offset_t g = ml_io_map(GPU_PA, GPU_SIZE);
