@@ -178,3 +178,31 @@ Segnalato dall'utente il 2026-11-02. Progetto di terzi, non un fork di Bergamota
 | G0 riordino stadio 9 | da fare | |
 | G1 NOP | da fare | |
 | G2-G7 | da fare | |
+
+## 5.2 Piano di debug integrato (2026-11-02): ricerca esterna su Snapintosh + misure su Poco X3 NFC
+
+Fonti: ricerca sul riuso di Snapintosh fornita dall'utente (solo fatti e metodo, nessun codice copiato; i file GPL di Snapintosh/q1n1 restano da evitare), ricerca sui registri a6xx (Linux `a6xx_*`, Mesa `a6xx.xml`), e il log `logs/surya-ios18-gpu11c.txt`.
+
+**Cosa le misure già confermano rispetto alla checklist esterna** (ordine Linux a6xx):
+- ME_INIT a 8 dword, `CP_SQE_CNTL=1`, `CP_SET_SECURE_MODE 0` dopo lo zap: nell'ordine giusto, tutti drenano.
+- Coerenza cache: ring e scratch sono non-cacheable (`VM_WIMG_WCOMB`) con flush; il `0` riletto da `CP_MEM_WRITE` non è una riga di cache stantia.
+- Nessun fault SMMU visibile (`sGFSR` 0, FSR del CB0 invariato a 0x400 prima del test).
+- `CP_NOP` e `CP_MEM_WRITE` lasciano `CP_IRQ=0`; `CP_IRQ=0x80` (`CP_ILLEGAL_INSTR_ERROR`) compare solo dopo `CACHE_FLUSH_TS`.
+- Reset senza panic circa un minuto dopo il test (uptime ~135 s), in `gpu10` e `gpu11`; non c'è un reset a `SQE_CNTL=1` come nella run 1 di q1n1.
+
+**Cosa il log non guarda ancora** (punti della checklist non coperti):
+1. `RBBM_SECVID_TRUST_CNTL` letto prima e dopo `CP_SET_SECURE_MODE 0`. Ipotesi [non verificata]: se il CP resta in modalità secure, le scritture in memoria non secure vengono scartate. Spiegherebbe il `0` riletto.
+2. `RBBM_INT_0_STATUS` (sticky: va cancellato con `RBBM_INT_CLEAR_CMD`) e `CP_INTERRUPT_STATUS` letti subito dopo l'avvio dell'SQE, dopo `ME_INIT` e dopo ogni pacchetto, con `CP_SQE_STAT_DATA`.
+3. FSR/FAR del CB0 **dopo** il test (oggi si stampa solo prima).
+4. `GBIF_HALT` (`0x3c45`) e `RBBM_GBIF_HALT` (`0x16`): lettura prima, poi azzeramento come Linux.
+5. Il registro `0x3da` va sostituito con `RBBM_VBIF_CLIENT_QOS_CNTL` (`0x10 = 3`).
+
+**Ordine proposto, un solo cambio per run, previsione scritta prima:**
+- Run A (solo diagnostica, nessun cambio di comportamento): punti 1-4 in sola lettura. Previsione: nessun cambio di esito.
+- Run B: `gpu10` senza `CACHE_FLUSH_TS`. Separa "il reset ritardato dipende da quel pacchetto" da "dipende dallo stato in cui il test lascia la GPU (slumber/GMU)".
+- Run C: correzione `0x3da`→`0x10` e azzeramento GBIF halt.
+- Run D: `CACHE_FLUSH_TS` con il bit TIMESTAMP (primo dword `0xC0000004`), e `CP_WAIT_FOR_IDLE` prima dell'evento se i pacchetti di Linux lo prevedono (da verificare).
+
+**Da non importare per errore da a8xx:** `CP_ME_INIT` a 7 dword, `CP_THREAD_CONTROL`, BR/BV, offset `A8XX_*`, tabelle protect x285. Su A618 vale `a630_protect`, un solo ring, zap `a615_zap.mbn`.
+
+**Idee riusabili più avanti (passi B-D, solo concetto):** disciplina di lifetime delle mappe (reserve, bind, pin, insert, unwire), resource list e latch fail-fast per il kext; front end AIR→NIR di air2ir3 (MIT, da verificare quanto sia legato al chip); copia CPU in framebuffer per i primi pixel indipendentemente dal CP. UniXNU `NativeAdreno` (BSD-2-Clause-Patent) è un template più pulito del kext Snapintosh.
