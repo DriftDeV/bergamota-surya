@@ -1,13 +1,18 @@
-From: surya port <local>
-Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), driver from the mxtpasontop/ios-sweet gpu branch 0078-0098, ported to this tree
-
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -444,4 +444,83 @@
+@@ -9,6 +9,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include "sweet_rpmh.h"
+ #include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -444,4 +445,394 @@
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
  }
-+
 +/*
 + * Read-only: the RPMh address and VLVL table (cmd-db aux data, one u16 per
 + * level, zero padded) of an ARC resource such as "gfx.lvl", for the GPU's
@@ -86,7 +91,344 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 +	return error;
 +}
++
++/* Generic ACTIVE payload (BCM votes, patch 0225): same transport as rh_send, N commands. */
++struct rh_command { uint32_t address, data; };
++static int
++rh_send_commands(const struct rh_command *commands, unsigned count, uint32_t wait)
++{
++	if (!commands || !count || count > rh_ncpt || count > 16 || (wait & ~((1u << count) - 1u))) {
++		return EINVAL;
++	}
++	const uint32_t enable_mask = (1u << count) - 1u;
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
++		    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < rh_ncpt; ++c) {
++			if (!(enabled & (1u << c))) {
++				continue;
++			}
++			uint32_t inherited = rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE);
++			for (unsigned n = 0; n < count; ++n) {
++				/* VRM has four registers; BCM addresses identify individual votes. */
++				uint32_t mask = (commands[n].address >> 16) == RH_VRM ? ~15u : ~0u;
++				if ((inherited & mask) == (commands[n].address & mask)) {
++					printf("SWEET RPMH: conflicting inherited request in TCS%u addr=%#x\n", t, inherited);
++					return EBUSY;
++				}
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		/* No payload was touched. Do not acknowledge somebody else's IRQ. */
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	/* From here an uncertain write/timeout quarantines our slot for this boot. */
++	rh_poisoned = true;
++	const unsigned ncmd = count;
++	printf("SWEET RPMH: TCS%u ACTIVE commands=%u wait=%#x irq-enable=%#x\n", t, count, wait, irq_en);
++	for (unsigned c = 0; c < ncmd; ++c) {
++		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		    !rh_sync(cmd + RH_ADDR, commands[c].address) ||
++		    !rh_sync(cmd + RH_DATA, commands[c].data)) {
++			return EIO;
++		}
++	}
++	if (!rh_sync(b + RH_WAIT, wait) || !rh_sync(b + RH_ENABLE, enable_mask) ||
++	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	uint32_t irq = 0, idle = 0, status[16] = {0};
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		bool complete = true;
++		for (unsigned c = 0; c < ncmd; ++c) {
++			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++			complete &= status[c] != 0xffffffffu &&
++			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		}
++		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++		    ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	if (!done) {
++		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		return ETIMEDOUT;
++	}
++	/* Proven completion: clear trigger before mode, then free only our commands. */
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	printf("SWEET RPMH: ACTIVE payload complete\n");
++	return 0;
++}
++
++
++/* Linux qcom_icc_bcm_init's cmd-db address + eight-byte bcm_db descriptor. */
++#define RH_BCM 5u
++static uint16_t
++rh_bcm_u16(uint32_t off)
++{
++	uint32_t lo = rh_read(rh_db, off & ~3u) >> (8u * (off & 3u));
++	uint32_t hi = rh_read(rh_db, (off + 1u) & ~3u) >> (8u * ((off + 1u) & 3u));
++	return (uint16_t)((lo & 0xffu) | ((hi & 0xffu) << 8));
++}
++
++int
++sweet_rpmh_bcm_info(const char *res, struct sweet_rpmh_bcm *info)
++{
++	uint32_t key[2] = { 0, 0 };
++	struct sweet_rpmh_bcm found = { 0 };
++	unsigned matches = 0, n = 0;
++	if (!res || !info) {
++		return EINVAL;
++	}
++	while (n < 8 && res[n]) {
++		key[n / 4] |= (uint32_t)(uint8_t)res[n] << (8u * (n % 4));
++		n++;
++	}
++	if (n == 0 || (n == 8 && res[n])) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	if (error) {
++		goto out;
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			error = EINVAL;
++			goto out;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t address = rh_read(rh_db, e + 16);
++			uint32_t off = aux + rh_db16(e + 22);
++			unsigned len = rh_db16(e + 20);
++			if (slave != RH_BCM || (address >> 16) != RH_BCM || (address & 3u) ||
++			    len < 8 || !rh_range(off, len)) {
++				error = EINVAL;
++				goto out;
++			}
++			/* Aux entries need not be word-aligned. Read via aligned DB words. */
++			found.address = address;
++			found.unit = (uint32_t)rh_bcm_u16(off) | ((uint32_t)rh_bcm_u16(off + 2) << 16);
++			found.width = rh_bcm_u16(off + 4);
++			found.vcd = rh_bcm_u16(off + 6) & 0xff;
++			found.reserved = rh_bcm_u16(off + 6) >> 8;
++			found.version = rh_db16(h + 8);
++			matches++;
++		}
++	}
++	if (matches != 1) {
++		error = ENODEV;
++	} else {
++		*info = found;
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++
++/*
++ * Downstream msm_bus path 125 -> 512, live sweet FDT. Units are bytes/s.
++ * Only this client is represented here. Shared DDR votes remain held for the
++ * boot: releasing an inherited apps-DRV vote requires global ownership tracking.
++ */
++#define RH_CRYPTO_COUNT 6u
++static bool rh_crypto_held;
++static uint64_t
++rh_bcm_div(uint64_t value, uint32_t divisor)
++{
++	return value && value < divisor ? 1 : value / divisor;
++}
++
++static int
++rh_crypto_plan(const struct sweet_rpmh_bcm info[RH_CRYPTO_COUNT],
++    struct rh_command commands[RH_CRYPTO_COUNT], uint32_t *wait)
++{
++	/* Order before sorting: CE0, SN11, SN0, SH0, MC0, ACV. */
++	static const uint16_t widths[] = { 8, 16, 16, 16, 4, 0 };
++	static const uint16_t ports[] = { 1, 1, 1, 2, 2, 0 };
++	const uint64_t average = 393600000ULL, peak = 3936000000ULL;
++	uint8_t domains[RH_CRYPTO_COUNT];
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		const struct sweet_rpmh_bcm *b = &info[i];
++		if (b->version != 0x1000 || b->reserved || !b->unit || b->vcd >= 16 ||
++		    (b->address >> 16) != RH_BCM || (b->address & 3u) ||
++		    (i < 5 && (!b->width || b->width > 64)) ||
++		    (i == 5 && (b->width != 0 || b->unit != 1))) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < i; ++j) {
++			if (info[j].address == b->address) {
++				return EINVAL;
++			}
++		}
++		uint64_t x = 0, y = 8; /* BCM ACV: apps bit, msm_bus_arb_rpmh.c. */
++		if (i < 5) {
++			x = rh_bcm_div(rh_bcm_div(average * b->width, widths[i] * ports[i]), b->unit);
++			y = rh_bcm_div(rh_bcm_div(peak * b->width, widths[i]), b->unit);
++		}
++		x = MIN(x, 0x3fffULL);
++		y = MIN(y, 0x3fffULL);
++		commands[i].address = b->address;
++		commands[i].data = (1u << 29) | ((uint32_t)x << 14) | (uint32_t)y;
++		domains[i] = b->vcd;
++	}
++	/* All commands for a VCD must precede that VCD's final commit. */
++	for (unsigned i = 1; i < RH_CRYPTO_COUNT; ++i) {
++		unsigned j = i;
++		while (j && domains[j] < domains[j - 1]) {
++			uint8_t domain = domains[j];
++			domains[j] = domains[j - 1]; domains[j - 1] = domain;
++			struct rh_command cmd = commands[j];
++			commands[j] = commands[j - 1]; commands[j - 1] = cmd;
++			j--;
++		}
++	}
++	*wait = 0;
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		if (i + 1 == RH_CRYPTO_COUNT || domains[i] != domains[i + 1]) {
++			commands[i].data |= 1u << 30;
++			*wait |= 1u << i;
++		}
++	}
++	return 0;
++}
++
++int
++sweet_rpmh_crypto_bw(void)
++{
++	static const char *const names[] = { "CE0", "SN11", "SN0", "SH0", "MC0", "ACV" };
++	struct sweet_rpmh_bcm info[RH_CRYPTO_COUNT];
++	struct rh_command commands[RH_CRYPTO_COUNT];
++	uint32_t wait;
++	/* Read/validate every descriptor before touching any TCS. */
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		int error = sweet_rpmh_bcm_info(names[i], &info[i]);
++		if (error) {
++			return error;
++		}
++	}
++	int error = rh_crypto_plan(info, commands, &wait);
++	if (error) {
++		return error;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (rh_poisoned) {
++		error = EIO;
++		goto out;
++	}
++	if (rh_crypto_held) {
++		goto out;
++	}
++	error = rh_map();
++	if (error) {
++		goto out;
++	}
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		printf("SWEET RPMH: crypto BCM[%u] addr=%#x data=%#x wait=%u\n",
++		    i, commands[i].address, commands[i].data, !!(wait & (1u << i)));
++	}
++	error = rh_send_commands(commands, RH_CRYPTO_COUNT, wait);
++	if (!error) {
++		rh_crypto_held = true;
++		printf("SWEET RPMH: crypto bandwidth held until reset\n");
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
  #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.h b/bsd/dev/sweet_rpmh.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_rpmh.h
+@@ -0,0 +1,19 @@
++#ifndef _BSD_DEV_SWEET_RPMH_H_
++#define _BSD_DEV_SWEET_RPMH_H_
++#include <sys/types.h>
++
++/* Raw cmd-db BCM auxiliary data; validate before using it to compute votes. */
++struct sweet_rpmh_bcm {
++	uint32_t address;
++	uint32_t unit;
++	uint16_t width;
++	uint8_t vcd;
++	uint8_t reserved;
++	uint16_t version;
++};
++
++/* Read-only lookup: no RPMh votes or TCS register writes. */
++int sweet_rpmh_bcm_info(const char *res, struct sweet_rpmh_bcm *info);
++/* Board crypto -> DDR ACTIVE vote, retained for this boot; no release API. */
++int sweet_rpmh_crypto_bw(void);
++#endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -57,6 +57,7 @@
@@ -105,19 +447,11 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
  	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
  	return 0;
  }
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -115,6 +115,7 @@
- bsd/dev/sweet_smmu.c			standard
- bsd/dev/sweet_a630.c			standard
- bsd/dev/sweet_a630_pas.c			standard
-+bsd/dev/sweet_gpu.c			standard
- bsd/dev/beryllium_wlan.c		standard
- bsd/dev/mem.c				standard
- bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2089 @@
+@@ -0,0 +1,3414 @@
 +/*
 + * SWEET: Adreno 618 GPU bring-up.
 + *
@@ -167,6 +501,12 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 + *               readback and software walks only (DT disables ATOS).
 + *   sweetgpu=9  8 plus cold CP ring/SQE register setup before the PAS test;
 + *               SQE control stays at initial zero; no commands submitted.
++ *   sweetgpu=10 9 plus SQE start, CP_ME_INIT and the CP tests (NOP, IB, first shader dispatch); with
++ *               sweetgpukeep=1 the GPU stays up for 6 rounds and is then shut down.
++ *   sweetgpu=11 10, but the GPU stays up for good (zap, SQE, OOB_GPU held, no shutdown thread) and the
++ *               kernel-internal API sweet_a618_* (GPU address space, submit, fences, ready hook) is
++ *               enabled, with an in-kernel API self-test (docs/SURYA_GPU_KERNEL_API.md).
++ *               Default off: every other value behaves exactly as before.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -175,6 +515,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +#include <kern/thread.h>
 +#include <kern/sched_prim.h>
 +#include <vm/pmap.h>
++#include <vm/vm_kern.h>
 +#include <vm/vm_kern.h>
 +#include <arm/caches_internal.h>
 +#include <pexpert/pexpert.h>
@@ -186,16 +527,11 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
-+/*
-+ * The signed zap PAS test (sweetgpu >= 7) needs the fork's SCM / crypto-bandwidth code (sweet_scm.c, not
-+ * ported yet): until then stages 7-9 stop here.
-+ */
-+static bool
-+sweet_scm_gpu_zap_test(void)
-+{
-+	printf("SWEET GPU: zap/PAS test not ported to the surya tree yet (sweet_scm.c)\n");
-+	return false;
-+}
++extern bool sweet_scm_gpu_zap_test(void);   /* sweet_scm.c */
++extern bool (*sweet_scm_zap_running_hook)(void);   /* sweet_scm.c: called while the zap runs */
++extern bool sweet_scm_zap_keep;                   /* sweet_scm.c: sweetgpukeep=1, no SHUTDOWN after the test */
++extern bool sweet_scm_zap_shutdown(void);
++extern void sweet_scm_probe(void);            /* sweet_scm.c, boot-arg sweetscm=1..4 */
 +extern void sweet_log_sync(void);       /* sweet_ufs.c */
 +extern int sweet_rpmh_arc_levels(const char *res, uint16_t *vals, unsigned max,
 +    unsigned *num, uint32_t *address);  /* sweet_rpmh.c */
@@ -1330,6 +1666,14 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +#define A6XX_CP_AHB_CNTL           0x98du
 +#define A6XX_RBBM_INT_0_STATUS     0x201u
 +#define A6XX_RBBM_CLOCK_CNTL       0xaeu
++#define A6XX_RBBM_GBIF_HALT        0x16u
++#define A6XX_RBBM_GBIF_HALT_ACK    0x17u
++#define A6XX_GBIF_HALT             0x3c45u
++#define A6XX_GBIF_HALT_ACK         0x3c46u
++#define A6XX_RBBM_SECVID_TRUST_CNTL 0xf400u
++#define A6XX_RBBM_SECVID_TSB_CNTL  0xf803u
++#define A6XX_CP_SQE_STAT_ADDR      0x908u
++#define A6XX_CP_SQE_STAT_DATA      0x909u
 +/* 32 KiB = 8192 dwords = 4096 quadwords; 4-dword RPTR update threshold.
 + * Bit27 disables automatic RPTR shadow writes for this first register test.
 + */
@@ -1470,28 +1814,98 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +	/* a618 thresholds and pool size from the phone driver; no UCHE/rendering
 +	 * setup or protected/security register access in this stage.
 +	 */
-+	const struct { uint32_t reg, value; } setup[] = {
-+		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0 },
-+		{ A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c },
-+		{ A6XX_CP_MEM_POOL_SIZE, 128 },
-+		{ A6XX_CP_AHB_CNTL, 1 },
-+		{ A6XX_CP_RB_RPTR_ADDR_LO, cp_buffers[2].va },
-+		{ A6XX_CP_RB_RPTR_ADDR_HI, 0 },
-+		{ A6XX_CP_RB_CNTL, CP_RING_CNTL },
-+		{ A6XX_CP_RB_BASE, cp_buffers[0].va },
-+		{ A6XX_CP_RB_BASE_HI, 0 },
-+		{ A6XX_CP_SQE_INSTR_BASE_LO, cp_buffers[1].va },
-+		{ A6XX_CP_SQE_INSTR_BASE_LO + 1, 0 },
++	/*
++	 * Write probe (diagnostic, boot 2026-11-02): the CP register file ignored the
++	 * first write. Write the non-CP registers the working A630 bring-up (0103
++	 * gpu_cp_hw_init) writes first, in its order, read each back and carry on, to
++	 * see whether the whole GPU register space ignores writes or only the CP block.
++	 * Every value is a Linux a6xx_hw_init value; none starts the CP or touches the
++	 * secure (SECVID) registers.
++	 */
++	{
++		const struct { const char *name; uint32_t reg, value; } probe[] = {
++			{ "CP_ADDR_MODE_CNTL",       0x842,  1 },
++			{ "VSC_ADDR_MODE_CNTL",      0xc01,  1 },
++			{ "GRAS_ADDR_MODE_CNTL",     0x8601, 1 },
++			{ "RB_ADDR_MODE_CNTL",       0x8e05, 1 },
++			{ "UCHE_ADDR_MODE_CNTL",     0xe00,  1 },
++			{ "RBBM_CLIENT_QOS_CNTL",    0x3da,  3 },
++			{ "RBBM_PERFCTR_BUSY_MASK",  0x50b,  0xffffffffu },
++			{ "UCHE_WRITE_THRU_BASE",    0xe07,  0xfffff000u },
++			{ "UCHE_GMEM_RANGE_MIN",     0xe0b,  0x100000 },
++			{ "UCHE_FILTER_CNTL",        0xe18,  0x804 },
++			{ "UCHE_CACHE_WAYS",         0xe17,  0x4 },
++			{ "PC_DBG_ECO_CNTL",         0x9e00, 0x00180000 },
++			{ "RBBM_INTF_HANG_INT_CNTL", 0x1f,   (1u << 30) | 0x1fffff },
++		};
++		unsigned stuck = 0;
++		for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); ++i) {
++			uint32_t was = gpu_rd(gpu, probe[i].reg * 4);
++			gpu_wr(gpu, probe[i].reg * 4, probe[i].value);
++			uint32_t got = gpu_rd(gpu, probe[i].reg * 4);
++			printf("SWEET GPU: probe %-24s reg=%#x was=%#x wrote=%#x read=%#x %s\n", probe[i].name,
++			    probe[i].reg, was, probe[i].value, got, got == probe[i].value ? "STICKS" : "IGNORED");
++			sweet_log_sync();
++			stuck += got == probe[i].value;
++		}
++		printf("SWEET GPU: probe: %u of %zu writes stuck; AHB fence status=%#x\n", stuck,
++		    sizeof(probe) / sizeof(probe[0]), gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
++		sweet_log_sync();
++	}
++	/* The A630 bring-up (0103 gpu_cp_hw_init) writes the UCHE ranges as 64-bit values; the probe above wrote
++	 * only the low words. a618 GMEM is 512 KiB. Read back and log; carry on either way. */
++	{
++		const struct { const char *name; uint32_t reg, lo, hi; } u64[] = {
++			{ "UCHE_WRITE_RANGE_MAX", 0xe05, 0xffffffc0u, 0x0001ffffu },
++			{ "UCHE_TRAP_BASE",       0xe09, 0xfffff000u, 0x0001ffffu },
++			{ "UCHE_WRITE_THRU_BASE", 0xe07, 0xfffff000u, 0x0001ffffu },
++			{ "UCHE_GMEM_RANGE_MIN",  0xe0b, 0x00100000u, 0 },
++			{ "UCHE_GMEM_RANGE_MAX",  0xe0d, 0x00100000u + 0x80000u - 1, 0 },
++		};
++		for (unsigned i = 0; i < sizeof(u64) / sizeof(u64[0]); ++i) {
++			gpu_wr(gpu, u64[i].reg * 4, u64[i].lo);
++			gpu_wr(gpu, (u64[i].reg + 1) * 4, u64[i].hi);
++			uint32_t lo = gpu_rd(gpu, u64[i].reg * 4), hi = gpu_rd(gpu, (u64[i].reg + 1) * 4);
++			printf("SWEET GPU: uche64 %-22s reg=%#x wrote=%#x:%08x read=%#x:%08x %s\n", u64[i].name, u64[i].reg,
++			    u64[i].hi, u64[i].lo, hi, lo, (lo == u64[i].lo && hi == u64[i].hi) ? "STICKS" : "IGNORED");
++		}
++		gpu_wr(gpu, 0xe19 * 4, (1u << 7) | 1);   /* UCHE_CLIENT_PF */
++		printf("SWEET GPU: uche64 UCHE_CLIENT_PF read=%#x\n", gpu_rd(gpu, 0xe19 * 4));
++		sweet_log_sync();
++	}
++	unsigned mismatch_fatal = 0;
++	const struct { uint32_t reg, value; bool must_stick; } setup[] = {
++		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0, false },
++		{ A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c, false },
++		{ A6XX_CP_MEM_POOL_SIZE, 128, false },
++		{ A6XX_CP_AHB_CNTL, 1, false },
++		{ A6XX_CP_RB_RPTR_ADDR_LO, cp_buffers[2].va, true },
++		{ A6XX_CP_RB_RPTR_ADDR_HI, 0, true },
++		{ A6XX_CP_RB_CNTL, CP_RING_CNTL, true },
++		{ A6XX_CP_RB_BASE, cp_buffers[0].va, true },
++		{ A6XX_CP_RB_BASE_HI, 0, true },
++		{ A6XX_CP_SQE_INSTR_BASE_LO, cp_buffers[1].va, true },
++		{ A6XX_CP_SQE_INSTR_BASE_LO + 1, 0, true },
 +	};
 +	for (unsigned i = 0; i < sizeof(setup) / sizeof(setup[0]); ++i) {
 +		gpu_wr(gpu, setup[i].reg * 4, setup[i].value);
 +		uint32_t got = gpu_rd(gpu, setup[i].reg * 4);
 +		printf("SWEET GPU: CP reg[%#x] wrote=%#x read=%#x\n", setup[i].reg, setup[i].value, got);
 +		if (got != setup[i].value) {
-+			printf("SWEET GPU: CP cold configuration readback mismatch\n");
-+			gpu_cp_diagnostics(gpu, "register mismatch");
-+			return false;
++			/* Boot 2026-11-02: the probe showed the GPU block takes writes (UCHE, ADDR_MODE
++			 * stick); CP_ROQ_THRESHOLDS_2 (0x8c2) reads 0. Log every mismatch and go on:
++			 * only the ring and SQE base registers must read back. */
++			printf("SWEET GPU: CP reg[%#x] MISMATCH (wrote %#x, read %#x)%s\n", setup[i].reg, setup[i].value, got,
++			    setup[i].must_stick ? " FATAL" : " (not required)");
++			if (setup[i].must_stick) {
++				mismatch_fatal++;
++			}
 +		}
++	}
++	if (mismatch_fatal) {
++		printf("SWEET GPU: CP cold configuration readback mismatch (%u required registers)\n", mismatch_fatal);
++		gpu_cp_diagnostics(gpu, "register mismatch");
++		return false;
 +	}
 +	uint32_t fault = gpu_rd(gpu, A6XX_CP_HW_FAULT * 4);
 +	uint32_t irq = gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4);
@@ -1535,6 +1949,200 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +	return ok;
 +}
 +/* End post-PAS CP comparison. */
++/*
++ * sweetgpu=10: start the CP and run a first command stream (Linux a6xx_hw_init order, as
++ * the working A630 bring-up 0103 gpu_cp_start/gpu_cp_nop_test): SQE_CNTL=1, CP_ME_INIT,
++ * then (zap authenticated) CP_SET_SECURE_MODE 0, a NOP, a CP_MEM_WRITE and a
++ * CACHE_FLUSH_TS timestamp, both read back from the scratch buffer. SECVID registers are
++ * never touched. Boot 2026-11-02 showed the register block takes writes; this is the
++ * first time this tree asks the CP to execute.
++ */
++#define CP_NOP                  16
++#define CP_ME_INIT              72
++#define CP_MEM_WRITE            61
++#define CP_EVENT_WRITE          70
++#define CP_SET_SECURE_MODE      102
++#define CACHE_FLUSH_TS          4
++#define CP_EVENT_WRITE_IRQ      0x80000000u
++#define CP_RING_OFF             0x04000u
++#define CP_RING_BYTES           0x8000u
++#define CP_SCRATCH_OFF          0x14000u
++#define CP_SCRATCH_VA           0x40020000u
++#define CP_SCRATCH_MEMWR        0x100u
++#define CP_SCRATCH_TS           0x110u
++static unsigned cp_ring_wptr;   /* dwords */
++
++static uint32_t
++cp_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++cp_pkt7(unsigned opcode, unsigned cnt)
++{
++	return 0x70000000u | cnt | (cp_parity(cnt) << 15) | ((opcode & 0x7fu) << 16) | (cp_parity(opcode) << 23);
++}
++
++static void
++cp_ring_emit(uint32_t v)
++{
++	*(volatile uint32_t *)(cp_memory + CP_RING_OFF + 4u * cp_ring_wptr) = v;
++	cp_ring_wptr = (cp_ring_wptr + 1) % (CP_RING_BYTES / 4);
++}
++
++static void
++cp_ring_flush(vm_offset_t gpu)
++{
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_RING_OFF), CP_RING_BYTES, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gpu_wr(gpu, A6XX_CP_RB_WPTR * 4, cp_ring_wptr);
++}
++
++static void
++cp_status_line(vm_offset_t gpu, const char *when)
++{
++	printf("SWEET GPU: CP %s: SQE_CNTL %#x RPTR %u WPTR %u HW_FAULT %#x CP_IRQ %#x PROTECT %#x CP_STATUS_1 %#x RBBM_STATUS %#x RBBM_IRQ %#x\n",
++	    when, gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(gpu, A6XX_CP_RB_WPTR * 4),
++	    gpu_rd(gpu, A6XX_CP_HW_FAULT * 4), gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(gpu, A6XX_CP_PROTECT_STATUS * 4),
++	    gpu_rd(gpu, A6XX_CP_STATUS_1 * 4), gpu_rd(gpu, A6XX_RBBM_STATUS * 4), gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	sweet_log_sync();
++}
++
++static void gpu_smmu_cb_faults(void);
++
++/*
++ * Run A (2026-11-02): read-only diagnostics, no behaviour change. Every register that could
++ * plausibly stop the SoC is read after a log sync, so the last printed line names it.
++ */
++static void
++cp_diag(vm_offset_t gpu, const char *when)
++{
++	printf("SWEET GPU: DIAG %s: GBIF_HALT %#x ACK %#x RBBM_GBIF_HALT %#x ACK %#x SECVID_TSB_CNTL %#x\n", when,
++	    gpu_rd(gpu, A6XX_GBIF_HALT * 4), gpu_rd(gpu, A6XX_GBIF_HALT_ACK * 4),
++	    gpu_rd(gpu, A6XX_RBBM_GBIF_HALT * 4), gpu_rd(gpu, A6XX_RBBM_GBIF_HALT_ACK * 4),
++	    gpu_rd(gpu, A6XX_RBBM_SECVID_TSB_CNTL * 4));
++	sweet_log_sync();
++	gpu_wr(gpu, A6XX_CP_SQE_STAT_ADDR * 4, 1);
++	printf("SWEET GPU: DIAG %s: CP_SQE_STAT_DATA %#x CP_HW_FAULT %#x CP_PROTECT_STATUS %#x\n", when,
++	    gpu_rd(gpu, A6XX_CP_SQE_STAT_DATA * 4), gpu_rd(gpu, A6XX_CP_HW_FAULT * 4), gpu_rd(gpu, A6XX_CP_PROTECT_STATUS * 4));
++	sweet_log_sync();
++	printf("SWEET GPU: DIAG %s: reading RBBM_SECVID_TRUST_CNTL\n", when);
++	sweet_log_sync();
++	printf("SWEET GPU: DIAG %s: RBBM_SECVID_TRUST_CNTL %#x\n", when, gpu_rd(gpu, A6XX_RBBM_SECVID_TRUST_CNTL * 4));
++	sweet_log_sync();
++}
++static bool
++cp_ring_wait_idle(vm_offset_t gpu, const char *what)
++{
++	for (unsigned i = 0; i < 100000; i++) {
++		if (gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) == cp_ring_wptr) {
++			printf("SWEET GPU: CP %s: ring idle (RPTR=WPTR=%u) RBBM_STATUS %#x\n", what, cp_ring_wptr,
++			    gpu_rd(gpu, A6XX_RBBM_STATUS * 4));
++			sweet_log_sync();
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: CP %s: ring did NOT drain\n", what);
++	cp_status_line(gpu, "after timeout");
++	return false;
++}
++
++/* SQE_CNTL 0 -> 1 (the only value Linux writes), then a6xx_cp_init's CP_ME_INIT. */
++static bool
++gpu_cp_start(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	cp_ring_wptr = 0;
++	gpu_wr(gpu, A6XX_CP_SQE_CNTL * 4, 1);
++	cp_status_line(gpu, "SQE enabled");
++	cp_ring_emit(cp_pkt7(CP_ME_INIT, 8));
++	cp_ring_emit(0x0000002f);
++	cp_ring_emit(0x00000003);
++	cp_ring_emit(0x20000000);
++	for (unsigned i = 0; i < 5; i++) {
++		cp_ring_emit(0);
++	}
++	cp_ring_flush(gpu);
++	return cp_ring_wait_idle(gpu, "CP_ME_INIT");
++}
++
++/* Runs between the zap's AUTH_AND_RESET and its SHUTDOWN (sweet_scm.c hook). */
++static bool
++gpu_cp_secure_nop(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	volatile uint32_t *memwr = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_MEMWR);
++	volatile uint32_t *ts = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_TS);
++	const uint32_t memval = 0x5ee70001u, seq = 0x600d0001u;
++	uint32_t nots = 0, nomw = 0;
++	PE_parse_boot_argn("sweetgpunots", &nots, sizeof(nots));   /* Run B: skip CACHE_FLUSH_TS */
++	PE_parse_boot_argn("sweetgpunomw", &nomw, sizeof(nomw));   /* Run C: skip CP_MEM_WRITE */
++	cp_diag(gpu, "before CP_SET_SECURE_MODE");
++	cp_ring_emit(cp_pkt7(CP_SET_SECURE_MODE, 1));
++	cp_ring_emit(0);
++	cp_ring_flush(gpu);
++	if (!cp_ring_wait_idle(gpu, "CP_SET_SECURE_MODE 0")) {
++		return false;
++	}
++	cp_diag(gpu, "after CP_SET_SECURE_MODE");
++	*memwr = 0;
++	*ts = 0;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++	/* One packet at a time: after each, the ring state and CP_INTERRUPT_STATUS say which one the SQE rejects. */
++	cp_status_line(gpu, "before the single packets");
++	cp_ring_emit(cp_pkt7(CP_NOP, 1));
++	cp_ring_emit(0);
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "CP_NOP");
++	cp_status_line(gpu, "after CP_NOP");
++	if (nomw) {
++		printf("SWEET GPU: CP CP_MEM_WRITE skipped (sweetgpunomw=1)\n");
++		sweet_log_sync();
++	} else {
++	cp_ring_emit(cp_pkt7(CP_MEM_WRITE, 3));
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_MEMWR));
++	cp_ring_emit(0);
++	cp_ring_emit(memval);
++	cp_ring_flush(gpu);
++	idle = cp_ring_wait_idle(gpu, "CP_MEM_WRITE") && idle;
++	}
++	cp_status_line(gpu, "after CP_MEM_WRITE");
++	cp_diag(gpu, "after CP_MEM_WRITE");
++	if (nots) {
++		printf("SWEET GPU: CP CACHE_FLUSH_TS skipped (sweetgpunots=1)\n");
++		sweet_log_sync();
++	} else {
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 4));
++	cp_ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_TS));
++	cp_ring_emit(0);
++	cp_ring_emit(seq);
++	cp_ring_flush(gpu);
++	idle = cp_ring_wait_idle(gpu, "CACHE_FLUSH_TS") && idle;
++	}
++	for (unsigned i = 0; i < 50000 && ((!nomw && *memwr != memval) || (!nots && *ts != seq)); i++) {
++		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++		delay(1);
++	}
++	printf("SWEET GPU: CP NOP test: CP_MEM_WRITE read back %#010x (want %#010x), CACHE_FLUSH_TS timestamp %#010x (want %#010x), RBBM_INT_0_STATUS %#x\n",
++	    *memwr, memval, *ts, seq, gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	cp_status_line(gpu, "after NOP submission");
++	cp_diag(gpu, "after the test");
++	gpu_smmu_cb_faults();
++	bool ok = idle && (nomw || *memwr == memval) && (nots || *ts == seq);
++	printf("SWEET GPU: CP NOP test %s\n", ok ? "PASSED: the CP fetched, executed and wrote back through the GPU SMMU" : "FAILED");
++	sweet_log_sync();
++	return ok;
++}
++
 +
 +static void
 +gpu_smmu_cb_faults(void)
@@ -1961,10 +2569,15 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 + * GX on; read the GX domain and the GPU core, then clear oob_gpu and the
 + * boot OOB as a successful start does, and send the GPU to slumber.
 + */
++static bool gpu_kept;
++
 +static bool
-+gpu_gx_test(bool zap, bool cp)
++gpu_gx_test(bool zap, bool cp, bool run, bool perm)
 +{
 +	uint32_t gx_gdscr;
++	int keep = 0;
++	PE_parse_boot_argn("sweetgpukeep", &keep, sizeof(keep));
++	sweet_scm_zap_keep = (keep != 0 || perm) && run && cp;   /* sweetgpu=11: always kept (perm) */
 +
 +	if (gmu_oob_set(OOB_GPU, "gpu")) {
 +		(void)gpu_report(&gx_gdscr);
@@ -1981,7 +2594,13 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +				sweet_log_sync();
 +				return false;
 +			}
++			if (run && !gpu_cp_start()) {
++				printf("SWEET GPU: CP start failed; retaining GX/GMU until reset\n");
++				sweet_log_sync();
++				return false;
++			}
 +		}
++		sweet_scm_zap_running_hook = (run && cp) ? gpu_cp_secure_nop : NULL;
 +		if (zap) {
 +			if (!(gx_gdscr & GDSC_PWR_ON)) {
 +				printf("SWEET GPU: zap skipped: GX not powered\n");
@@ -1992,7 +2611,19 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +				return false;
 +			}
 +		}
-+		if (cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_post_pas_check()) {
++		if (run && cp && sweet_scm_zap_keep) {
++			/* sweetgpukeep=1: GX, GMU, zap and SQE stay up; sweet_gpu_run starts the keep-alive thread */
++			gpu_kept = true;
++			return true;
++		}
++		if (run && cp) {
++			/* back to the state the next run expects: SQE stopped */
++			vm_offset_t g = ml_io_map(GPU_PA, GPU_SIZE);
++			if (g) {
++				gpu_wr(g, A6XX_CP_SQE_CNTL * 4, 0);
++			}
++		}
++		if (!run && cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_post_pas_check()) {
 +			printf("SWEET GPU: CP post-PAS state changed; retaining GX/GMU until reset\n");
 +			sweet_log_sync();
 +			return false;
@@ -2012,6 +2643,1024 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +	gpu_wr(gmu, GMU_CM3_SYSRESET, 1);
 +	delay(10);
 +	gpu_gmu_state("reset again");
++}
++
++/*
++ * Step 1 of the roadmap (sweetgpukeep=1 with sweetgpu=10): after the first CP test the GPU stays up (GX on, GMU
++ * running, zap not shut down, SQE running). A kernel thread repeats a NOP + CP_MEM_WRITE + CACHE_FLUSH_TS round every
++ * 15 s, six times, logs the state, then shuts everything down in the order the single-shot test used.
++ */
++static int gpu_keep_chan;
++
++static bool
++gpu_cp_repeat(unsigned round)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	volatile uint32_t *memwr = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_MEMWR);
++	volatile uint32_t *ts = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_SCRATCH_TS);
++	const uint32_t memval = 0x5ee70000u + round, seq = 0x600d0000u + round;
++	*memwr = 0;
++	*ts = 0;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++	cp_ring_emit(cp_pkt7(CP_NOP, 1));
++	cp_ring_emit(0);
++	cp_ring_emit(cp_pkt7(CP_MEM_WRITE, 3));
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_MEMWR));
++	cp_ring_emit(0);
++	cp_ring_emit(memval);
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 4));
++	cp_ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_SCRATCH_TS));
++	cp_ring_emit(0);
++	cp_ring_emit(seq);
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "KEEP round");
++	for (unsigned i = 0; i < 50000 && (*memwr != memval || *ts != seq); i++) {
++		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++		delay(1);
++	}
++	bool ok = idle && *memwr == memval && *ts == seq;
++	printf("SWEET GPU: KEEP round %u %s: memwr %#x (want %#x) ts %#x (want %#x) CP_IRQ %#x RBBM_STATUS %#x TRUST_CNTL %#x RPMH_POWER_STATE %#x\n",
++	    round, ok ? "PASSED" : "FAILED", *memwr, memval, *ts, seq, gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4),
++	    gpu_rd(gpu, A6XX_RBBM_STATUS * 4), gpu_rd(gpu, A6XX_RBBM_SECVID_TRUST_CNTL * 4), gpu_rd(gmu, GMU_RPMH_POWER_STATE));
++	sweet_log_sync();
++	return ok;
++}
++
++/*
++ * Roadmap step 2: a real indirect buffer. The main ring only holds CP_INDIRECT_BUFFER; the CP fetches the IB through the
++ * GPU SMMU from the scratch page (VA CP_SCRATCH_VA + 0x1000) and runs CP_MEM_WRITE, CP_REG_TO_MEM (reads the CP_RB_BASE
++ * register into memory, known value 0x40000000), CP_MEMCPY (copies the CP_MEM_WRITE result) and CACHE_FLUSH_TS.
++ * CP_MEMCPY (0x53) is the least certain opcode on the a618 SQE: if it is illegal it shows as CP_IRQ 0x80 and its own FAIL.
++ */
++#define CP_INDIRECT_BUFFER      63
++#define CP_REG_TO_MEM           62
++#define CP_MEMCPY               83
++#define CP_WAIT_MEM_WRITES      18
++#define CP_WAIT_FOR_IDLE        38
++#define CP_IB_OFF               0x1000u
++#define CP_IB_MEMWR             0x120u
++#define CP_IB_REG2MEM           0x130u
++#define CP_IB_MEMCPY            0x140u
++#define CP_IB_TS                0x150u
++
++static bool
++gpu_cp_ib_test(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	volatile uint32_t *ib = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + CP_IB_OFF);
++	volatile uint32_t *res = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF);
++	const uint32_t memval = 0x1b0a0001u, seq = 0x1b0b0001u, regval = 0x40000000u;
++	unsigned n = 0;
++	for (unsigned i = 0; i < 0x40; i++) {
++		res[CP_IB_MEMWR / 4 + i] = 0;
++	}
++	ib[n++] = cp_pkt7(CP_MEM_WRITE, 3);
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMWR);
++	ib[n++] = 0;
++	ib[n++] = memval;
++	ib[n++] = cp_pkt7(CP_REG_TO_MEM, 3);
++	ib[n++] = (A6XX_CP_RB_BASE) | (1u << 18);
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_REG2MEM);
++	ib[n++] = 0;
++	ib[n++] = cp_pkt7(CP_WAIT_MEM_WRITES, 0);   /* the MEM_WRITE must land before MEMCPY reads it (run ib: MEMCPY copied 0) */
++	ib[n++] = cp_pkt7(CP_WAIT_FOR_IDLE, 0);
++	ib[n++] = cp_pkt7(CP_MEMCPY, 5);
++	ib[n++] = 1;
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMWR);
++	ib[n++] = 0;
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_MEMCPY);
++	ib[n++] = 0;
++	ib[n++] = cp_pkt7(CP_EVENT_WRITE, 4);
++	ib[n++] = CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ;
++	ib[n++] = (uint32_t)(CP_SCRATCH_VA + CP_IB_TS);
++	ib[n++] = 0;
++	ib[n++] = seq;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x2000, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	cp_ring_emit(cp_pkt7(CP_INDIRECT_BUFFER, 3));
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CP_IB_OFF));
++	cp_ring_emit(0);
++	cp_ring_emit(n);
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "IB");
++	for (unsigned i = 0; i < 50000 && (res[CP_IB_TS / 4] != seq || res[CP_IB_MEMCPY / 4] != memval); i++) {
++		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++		delay(1);
++	}
++	bool wr = res[CP_IB_MEMWR / 4] == memval, r2m = res[CP_IB_REG2MEM / 4] == regval;
++	bool cpy = res[CP_IB_MEMCPY / 4] == memval, ts = res[CP_IB_TS / 4] == seq;
++	printf("SWEET GPU: IB test %s: MEM_WRITE %s (%#x), REG_TO_MEM %s (%#x want %#x), MEMCPY %s (%#x), CACHE_FLUSH_TS %s (%#x), CP_IRQ %#x, HW_FAULT %#x\n",
++	    (idle && wr && r2m && cpy && ts) ? "PASSED" : "FAILED", wr ? "ok" : "FAIL", res[CP_IB_MEMWR / 4],
++	    r2m ? "ok" : "FAIL", res[CP_IB_REG2MEM / 4], regval, cpy ? "ok" : "FAIL", res[CP_IB_MEMCPY / 4],
++	    ts ? "ok" : "FAIL", res[CP_IB_TS / 4], gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(gpu, A6XX_CP_HW_FAULT * 4));
++	sweet_log_sync();
++	return idle && wr && r2m && cpy && ts;
++}
++
++
++/*
++ * Roadmap step 2b: the first shader. A real compute dispatch of tools/ir3asm/first_store.asm (one invocation stores
++ * 0xcafe0001 into dword 0 of a UAV buffer). The register sequence is Mesa computerator's a6xx path, generated on the host
++ * by research/mesa-ir3/csgen (documented in tools/ir3asm/README.md): state registers, shader and UAV descriptor
++ * preload, CP_SET_MARKER compute, NDRANGE, CP_EXEC_CS, CP_WAIT_FOR_IDLE and a CACHE_FLUSH_TS timestamp. Everything lives in
++ * the scratch page: shader +0x2000, UAV descriptor +0x2400, target +0x2800, command stream +0x3000.
++ */
++#define CS_SHADER_OFF   0x2000u
++#define CS_DESC_OFF     0x2400u
++#define CS_TARGET_OFF   0x2800u
++#define CS_IB_OFF       0x3000u
++#define CS_TS_OFF       0x160u
++#define CS_TS_SEQ       0xc0de0001u
++/* generated by research/mesa-ir3/csgen: a618 compute dispatch of first_store.asm. VAs: shader 0x40022000, UAV descriptor 0x40022400, target 0x40022800, timestamp 0x40020160 (seq 0xc0de0001). */
++static const uint32_t cs_ib[97] = {
++	0x40ae0f01, 0x00000020, 0x48ae0401, 0x00000000, 0x48980401, 0x0000001f,
++	0x40980501, 0x00000000, 0x40a0f801, 0x00000000, 0x40b60001, 0x00108000,
++	0x40860001, 0x00000880, 0x40ae0301, 0x00000430, 0x40ae0001, 0x00000000,
++	0x40be0401, 0x00080000, 0x48960001, 0x00000000, 0x400e1201, 0x00000001,
++	0x70dc801e, 0x0000ab00, 0x00000005, 0x0000bb08, 0x000000bf, 0x0000b987,
++	0x00000100, 0x0000a9bb, 0x00400100, 0x0000a9bc, 0x00000001, 0x0000a9b0,
++	0x80100080, 0x0000a9b1, 0x00000001, 0x0000b997, 0xfcfcfcfc, 0x0000b998,
++	0x000002fc, 0x0000a9b4, 0x40022000, 0x0000a9b5, 0x00000000, 0x0000a9bc,
++	0x00000001, 0x0000a9f2, 0x40022400, 0x0000a9f3, 0x00000000, 0x0000aa00,
++	0x00000001, 0x70348003, 0x00760000, 0x40022000, 0x00000000, 0x70348003,
++	0x0076c000, 0x40022400, 0x00000000, 0x70e50001, 0x00000008, 0x70dc8014,
++	0x0000b990, 0x00000003, 0x0000b991, 0x00000001, 0x0000b992, 0x00000000,
++	0x0000b993, 0x00000001, 0x0000b994, 0x00000000, 0x0000b995, 0x00000001,
++	0x0000b996, 0x00000000, 0x0000b999, 0x00000001, 0x0000b99a, 0x00000001,
++	0x0000b99b, 0x00000001, 0x70b30004, 0x00000000, 0x00000001, 0x00000001,
++	0x00000001, 0x70268000, 0x70460004, 0x80000004, 0x40020160, 0x00000000,
++	0xc0de0001,
++};
++static const uint32_t cs_shader[] = {
++	0xcafe0001, 0x204cc000, 0x00000000, 0x204cc001, 0x00000000, 0x00000500,
++	0x01674000, 0xc0260000, 0x00000000, 0x03000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000,
++};
++static const uint32_t cs_uav_desc[16] = {
++	0x12c06880, 0x00000004, 0x80000000, 0x00000000, 0x40022800, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++
++static bool
++gpu_cp_dispatch_test(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	volatile uint32_t *base = (volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF);
++	for (unsigned i = 0; i < sizeof(cs_shader) / 4; i++) {
++		base[CS_SHADER_OFF / 4 + i] = cs_shader[i];
++	}
++	for (unsigned i = 0; i < 16; i++) {
++		base[CS_DESC_OFF / 4 + i] = cs_uav_desc[i];
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		base[CS_TARGET_OFF / 4 + i] = 0xdeadbee0u + i;
++	}
++	for (unsigned i = 0; i < sizeof(cs_ib) / 4; i++) {
++		base[CS_IB_OFF / 4 + i] = cs_ib[i];
++	}
++	base[CS_TS_OFF / 4] = 0;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x4000, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET GPU: DISPATCH: running first_store (%u shader dwords, %u stream dwords)\n",
++	    (unsigned)(sizeof(cs_shader) / 4), (unsigned)(sizeof(cs_ib) / 4));
++	sweet_log_sync();
++	cp_ring_emit(cp_pkt7(CP_INDIRECT_BUFFER, 3));
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + CS_IB_OFF));
++	cp_ring_emit(0);
++	cp_ring_emit((uint32_t)(sizeof(cs_ib) / 4));
++	cp_ring_flush(gpu);
++	bool idle = cp_ring_wait_idle(gpu, "DISPATCH");
++	for (unsigned i = 0; i < 50000 && (base[CS_TARGET_OFF / 4] != 0xcafe0001u || base[CS_TS_OFF / 4] != CS_TS_SEQ); i++) {
++		flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x4000, TRUE);
++		delay(1);
++	}
++	bool ok = idle && base[CS_TARGET_OFF / 4] == 0xcafe0001u && base[CS_TS_OFF / 4] == CS_TS_SEQ;
++	printf("SWEET GPU: DISPATCH %s: target %#x %#x %#x %#x (want 0xcafe0001 first), ts %#x (want %#x), CP_IRQ %#x HW_FAULT %#x RBBM_STATUS %#x RBBM_INT_0 %#x\n",
++	    ok ? "PASSED" : "FAILED", base[CS_TARGET_OFF / 4], base[CS_TARGET_OFF / 4 + 1], base[CS_TARGET_OFF / 4 + 2],
++	    base[CS_TARGET_OFF / 4 + 3], base[CS_TS_OFF / 4], CS_TS_SEQ, gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4),
++	    gpu_rd(gpu, A6XX_CP_HW_FAULT * 4), gpu_rd(gpu, A6XX_RBBM_STATUS * 4), gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	sweet_log_sync();
++	return ok;
++}
++
++
++/* ------------------------------------------------------------------ */
++/* sweetgpu=11: permanent GPU core and the kernel-internal API         */
++/* ------------------------------------------------------------------ */
++
++/*
++ * boot-arg sweetgpu=11 runs every stage of sweetgpu=10 (GMU, HFI, GX on, signed zap, SQE, CP_ME_INIT,
++ * CP_SET_SECURE_MODE 0) and then keeps the GPU up for good: no shutdown thread, GX held on through OOB_GPU, the zap
++ * left running. The kernel-internal API sweet_a618_* (docs/SURYA_GPU_KERNEL_API.md) is then usable. Same shape as the
++ * Poco F1 sweet_gpu_* interface (sweet_a630.c): the kernel owns the GPU address space (context bank 1, ASID 2) and the
++ * ring, clients only ask. The caller serializes every call (one lock in the IOKit layer); nothing here locks.
++ * Without sweetgpu=11 none of this code runs.
++ *
++ * Client address space: [A618_GVM_BASE, A618_GVM_END) of context bank 1, 4 KiB GPU pages (xnu's PAGE_SIZE is 16 KiB:
++ * one PTE per 4 KiB, never PAGE_SIZE), L1 entries 2 and 3 of the static L1 table of gpu_cp_memory_setup, L2/L3 tables
++ * taken on demand from a pool of normal non-cacheable pages so the SMMU walker sees what the CPU wrote.
++ */
++#define A618_GVM_BASE           0x80000000ull
++#define A618_GVM_END            0x100000000ull
++#define A618_GVM_GUARD          0x1000ull       /* unmapped page after every kernel-placed buffer */
++#define A618_GVM_MAXFREE        4096
++#define A618_PTP_TABLE          0x1000ull       /* a GPU table is 4 KiB */
++#define A618_PTP_PAGES          1028            /* 4 MiB: 2 L2 + 1024 L3 (2 MiB each) + 2 spare; a whole number of 16 KiB pages */
++#define A618_PTP_PAGES_MIN      260             /* fallback: 2 L2 + 256 L3 (512 MiB of address space), 65 xnu pages */
++#define A618_SCRATCH_FENCE      0x200u          /* scratch page offset: last completed sequence number (CACHE_FLUSH_TS target) */
++#define A618_MAX_IBS            128
++#define A618_PC_CCU_INVALIDATE_DEPTH 24         /* pm4.xml.h event types, as Linux a6xx_submit */
++#define A618_PC_CCU_INVALIDATE_COLOR 25
++#define A618_CACHE_INVALIDATE        49         /* pm4.xml.h CACHE_INVALIDATE: GPU-side cache (UCHE) invalidate before each submit */
++#define A618_SMMU_FAULT_BITS    0xc00001feu     /* CB FSR fault bits; bit 10 reads 0x400 from boot on and is ignored */
++#define A618_CHIP_ID            0x06010800u
++#define GMU_AO_COUNTER_L        GMU_REG(0x1f888)        /* GMU always-on counter, 19.2 MHz (a6xx_gmu.xml 0x5088 + 0x1a800) */
++#define GMU_AO_COUNTER_H        GMU_REG(0x1f889)
++
++/* The 13 API functions, the hook and its race-free setter (declared first: no missing prototypes). */
++bool sweet_a618_ready(void);
++bool sweet_a618_param(uint32_t which, uint64_t *value);
++bool sweet_a618_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken);
++bool sweet_a618_iova_reserve(uint64_t iova, uint64_t size);
++void sweet_a618_iova_free(uint64_t iova, uint64_t size);
++bool sweet_a618_vm_map(uint64_t iova, uint64_t pa, bool readonly);
++void sweet_a618_vm_unmap(uint64_t iova, uint64_t size);
++void sweet_a618_cache_sync(void *va, size_t len);
++uint32_t sweet_a618_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
++bool sweet_a618_fence_done(uint32_t fence);
++uint32_t sweet_a618_fence_last(void);
++void sweet_a618_mark_lost(void);
++void sweet_a618_report(const char *why);
++extern void (*sweet_a618_ready_hook)(void);
++void sweet_a618_set_ready_hook(void (*hook)(void));
++
++/* Called once, from the self-test thread, when the self-test passed (or by the setter if that already happened). */
++void (*sweet_a618_ready_hook)(void);
++
++static struct {
++	bool     ready;         /* core initialised (and, once the self-test passed, usable by clients) */
++	bool     lost;          /* a submission did not complete or the SMMU faulted: nothing more goes to the CP */
++	uint32_t seqno;         /* last submitted sequence number */
++	uint32_t submissions, hangs;
++	uint64_t bytes_mapped;
++} a618_dev;
++static vm_offset_t a618_gpu, a618_smmu;         /* mappings of the GPU core and of the GPU SMMU */
++static vm_offset_t a618_ptp;                    /* page-table pool: kernel VA, PA, size, pages handed out */
++static uint64_t a618_ptp_pa;
++static unsigned a618_ptp_pages, a618_ptp_used;
++static struct {
++	uint64_t start, size;
++} a618_free[A618_GVM_MAXFREE];                  /* free iova ranges, sorted, coalesced */
++static unsigned a618_nfree;
++static int a618_published, a618_hook_fired;     /* accessed with __atomic builtins only */
++
++/*
++ * Physically contiguous, zeroed block switched to normal non-cacheable (WCOMB), exactly as gpu_cp_memory_setup does for
++ * the ring: the SMMU walker, the CP and the CPU all see the same bytes. Size must be a multiple of the xnu page size.
++ */
++static bool
++a618_dma_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
++{
++	vm_offset_t kva;
++
++	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPU: API core: no contiguous DMA memory (%lu bytes)\n", (unsigned long)size);
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (!pn || ptoa_64(pn) + size > (1ull << 36)) {
++		return false;
++	}
++	for (unsigned i = 1; i < size / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			printf("SWEET GPU: API core: DMA block not physically contiguous\n");
++			return false;
++		}
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	for (unsigned i = 0; i < size / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	*va = kva;
++	*pa = ptoa_64(pn);
++	return true;
++}
++
++/* A table page of the pool (zeroed by KMA_ZERO); 0 when the pool is used up. */
++static uint64_t
++a618_table_page(void)
++{
++	if (a618_ptp_used >= a618_ptp_pages) {
++		return 0;
++	}
++	return a618_ptp_pa + (uint64_t)(a618_ptp_used++) * A618_PTP_TABLE;
++}
++
++static volatile uint64_t *
++a618_table_va(uint64_t pa)
++{
++	if (!a618_ptp || pa < a618_ptp_pa || pa - a618_ptp_pa >= (uint64_t)a618_ptp_pages * A618_PTP_TABLE || (pa & 0xfff)) {
++		return NULL;
++	}
++	return (volatile uint64_t *)(a618_ptp + (pa - a618_ptp_pa));
++}
++
++/* Slot of the level-3 entry for iova; creates the missing tables when asked. NULL: not mapped, or the pool is full. */
++static volatile uint64_t *
++a618_slot(uint64_t iova, bool create)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(cp_memory + CP_L1), *tab;
++	uint64_t e, pa;
++	unsigned i1 = (unsigned)(iova >> 30) & 3, i2 = (unsigned)(iova >> 21) & 0x1ff, i3 = (unsigned)(iova >> 12) & 0x1ff;
++
++	if (!cp_memory || iova < A618_GVM_BASE || iova >= A618_GVM_END) {
++		return NULL;
++	}
++	e = l1[i1];
++	if ((e & 3) != PTE_TABLE) {
++		if (!create || !(pa = a618_table_page())) {
++			return NULL;
++		}
++		cp_write64(cp_memory, CP_L1 + 8 * i1, pa | PTE_TABLE);
++		e = pa | PTE_TABLE;
++	}
++	if (!(tab = a618_table_va(e & CP_PA_MASK))) {
++		return NULL;
++	}
++	e = tab[i2];
++	if ((e & 3) != PTE_TABLE) {
++		if (!create || !(pa = a618_table_page())) {
++			return NULL;
++		}
++		cp_write64((vm_offset_t)(tab + i2), 0, pa | PTE_TABLE);
++		e = pa | PTE_TABLE;
++	}
++	if (!(tab = a618_table_va(e & CP_PA_MASK))) {
++		return NULL;
++	}
++	return tab + i3;
++}
++
++/* TLBIALL of context bank 1, then TLBSYNC (the same registers gpu_cp_memory_setup uses). */
++static void
++a618_tlb_flush(void)
++{
++	vm_offset_t b = a618_smmu + SMMU_CB(CP_CB);
++
++	gpu_wr(b, SMMU_CB_TLBIALL, 0);
++	(void)smmu_sync(b, SMMU_CB_TLBSYNC, SMMU_CB_TLBSTATUS);
++}
++
++/* GPU core registers may be read only with GX on and the GMU AHB fence open (a closed fence drops or hangs accesses). */
++static bool
++a618_regs_safe(void)
++{
++	return a618_gpu && cc && gmu && (gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) &&
++	       !(gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF) && gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL) == 0;
++}
++
++/* True when the core is initialised and no submission failed. */
++bool
++sweet_a618_ready(void)
++{
++	return a618_dev.ready && !a618_dev.lost;
++}
++
++/* First-fit allocation of size bytes plus one unmapped guard page; taken is what sweet_a618_iova_free gets back. */
++bool
++sweet_a618_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken)
++{
++	if (!a618_dev.ready || !iova || !taken || size == 0 || (size & 0xfff) || size > A618_GVM_END - A618_GVM_BASE) {
++		return false;
++	}
++	uint64_t need = size + A618_GVM_GUARD;
++	for (unsigned i = 0; i < a618_nfree; i++) {
++		if (a618_free[i].size >= need) {
++			*iova = a618_free[i].start;
++			*taken = need;
++			a618_free[i].start += need;
++			a618_free[i].size -= need;
++			if (a618_free[i].size == 0) {
++				memmove(&a618_free[i], &a618_free[i + 1], (a618_nfree - i - 1) * sizeof(a618_free[0]));
++				a618_nfree--;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Take exactly [iova, iova+size) out of the free list (a client that chose its own address). */
++bool
++sweet_a618_iova_reserve(uint64_t iova, uint64_t size)
++{
++	if (!a618_dev.ready || size == 0 || (size & 0xfff) || (iova & 0xfff) || iova < A618_GVM_BASE ||
++	    size > A618_GVM_END - A618_GVM_BASE || iova > A618_GVM_END - size) {
++		return false;
++	}
++	for (unsigned i = 0; i < a618_nfree; i++) {
++		uint64_t s = a618_free[i].start, e = s + a618_free[i].size;
++		if (iova < s || iova + size > e) {
++			continue;
++		}
++		if (iova == s && iova + size == e) {
++			memmove(&a618_free[i], &a618_free[i + 1], (a618_nfree - i - 1) * sizeof(a618_free[0]));
++			a618_nfree--;
++		} else if (iova == s) {
++			a618_free[i].start += size;
++			a618_free[i].size -= size;
++		} else if (iova + size == e) {
++			a618_free[i].size -= size;
++		} else {
++			if (a618_nfree == A618_GVM_MAXFREE) {
++				return false;
++			}
++			memmove(&a618_free[i + 1], &a618_free[i], (a618_nfree - i) * sizeof(a618_free[0]));
++			a618_nfree++;
++			a618_free[i].size = iova - s;
++			a618_free[i + 1].start = iova + size;
++			a618_free[i + 1].size = e - (iova + size);
++		}
++		return true;
++	}
++	return false;
++}
++
++/* Give a range back, coalescing; a full list drops the range (address space is lost, never corrupted).
++ * 2026-11-02: ranges are NOT recycled by default. The first userland test faulted on the iova of an already freed
++ * selftest buffer (stale GPU cache or descriptor state for a reused VA with different contents). Never reusing a VA
++ * removes that class of problem; the 2 GiB window is ample for bring-up. Set a618_recycle_va to restore recycling. */
++static bool a618_recycle_va;
++void
++sweet_a618_iova_free(uint64_t iova, uint64_t size)
++{
++	unsigned i = 0;
++
++	if (!a618_recycle_va) {
++		return;
++	}
++	if (size == 0 || iova < A618_GVM_BASE || size > A618_GVM_END - A618_GVM_BASE || iova > A618_GVM_END - size) {
++		return;
++	}
++	while (i < a618_nfree && a618_free[i].start < iova) {
++		i++;
++	}
++	if (i > 0 && a618_free[i - 1].start + a618_free[i - 1].size == iova) {
++		a618_free[i - 1].size += size;
++		if (i < a618_nfree && a618_free[i - 1].start + a618_free[i - 1].size == a618_free[i].start) {
++			a618_free[i - 1].size += a618_free[i].size;
++			memmove(&a618_free[i], &a618_free[i + 1], (a618_nfree - i - 1) * sizeof(a618_free[0]));
++			a618_nfree--;
++		}
++		return;
++	}
++	if (i < a618_nfree && iova + size == a618_free[i].start) {
++		a618_free[i].start = iova;
++		a618_free[i].size += size;
++		return;
++	}
++	if (a618_nfree == A618_GVM_MAXFREE) {
++		printf("SWEET GPU: API core: iova free list full; %#llx+%#llx lost\n", iova, size);
++		return;
++	}
++	memmove(&a618_free[i + 1], &a618_free[i], (a618_nfree - i) * sizeof(a618_free[0]));
++	a618_nfree++;
++	a618_free[i].start = iova;
++	a618_free[i].size = size;
++}
++
++/* Map one 4 KiB GPU page; false when the table pool is full or pa does not fit the SMMU. No TLB work: submit does it. */
++bool
++sweet_a618_vm_map(uint64_t iova, uint64_t pa, bool readonly)
++{
++	volatile uint64_t *slot;
++
++	if (!a618_dev.ready || (pa & ~CP_PA_MASK) || (iova & 0xfff) || !(slot = a618_slot(iova, true))) {
++		return false;
++	}
++	cp_write64((vm_offset_t)slot, 0, pa | PTE_PAGE_NC | (readonly ? (1ull << 7) : 0));     /* AP[2] = read-only */
++	a618_dev.bytes_mapped += 0x1000;
++	return true;
++}
++
++/* Clear the pages of [iova, iova+size) and invalidate the context's TLB. */
++void
++sweet_a618_vm_unmap(uint64_t iova, uint64_t size)
++{
++	if (!a618_ptp || !a618_smmu) {
++		return;
++	}
++	for (uint64_t d = 0; d < size; d += 0x1000) {
++		volatile uint64_t *slot = a618_slot(iova + d, false);
++		if (slot && *slot) {
++			cp_write64((vm_offset_t)slot, 0, 0);
++			a618_dev.bytes_mapped -= 0x1000;
++		}
++	}
++	a618_tlb_flush();
++}
++
++/* Make CPU stores to kernel memory visible to the GPU and drop stale lines (dc civac by VA). */
++void
++sweet_a618_cache_sync(void *va, size_t len)
++{
++	sweet_dma_sync_va(va, len);
++}
++
++/* msm MSM_PARAM_* numbers (include/uapi/drm/msm_drm.h); false for parameters this core does not answer. */
++bool
++sweet_a618_param(uint32_t which, uint64_t *value)
++{
++	if (!a618_dev.ready || !value) {
++		return false;
++	}
++	switch (which) {
++	case 1:  *value = 618; return true;                     /* GPU_ID */
++	case 2:  *value = 0x80000; return true;                 /* GMEM_SIZE: 512 KiB */
++	case 3:  *value = A618_CHIP_ID; return true;            /* CHIP_ID */
++	case 4:  /* MAX_FREQ: top level of the fused speed bin's DT table (gpu_dcvs_votes); 0 when that table was not built.
++	          * The GPU itself stays at the boot level (180 MHz, no DCVS yet). */
++		*value = gx_levels ? (uint64_t)gx_khz[gx_levels - 1] * 1000ull : 0;
++		return true;
++	case 5:  /* TIMESTAMP: the GMU always-on counter (19.2 MHz), what Linux a6xx_get_timestamp reads */
++		*value = (uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_L) | ((uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_H) << 32);
++		return true;
++	case 6:  *value = 0x100000; return true;                /* GMEM_BASE */
++	case 7:  *value = 1; return true;                       /* PRIORITIES */
++	case 8:  *value = 0; return true;                       /* PP_PGTABLE */
++	case 9:  *value = a618_dev.hangs; return true;          /* FAULTS */
++	case 10: *value = 0; return true;                       /* SUSPENDS: the GPU never suspends here */
++	case 14: *value = A618_GVM_BASE; return true;           /* VA_START */
++	case 15: *value = A618_GVM_END - A618_GVM_BASE; return true;    /* VA_SIZE */
++	case 16: *value = 14; return true;                      /* HIGHEST_BANK_BIT (Linux ubwc_config.c, sc7180: ubwc_2_0_hbb14) */
++	case 18: *value = 6; return true;                       /* UBWC_SWIZZLE (inference: the Linux a6xx default) */
++	case 19: *value = 0; return true;                       /* MACROTILE_MODE (inference: 4 channels) */
++	default: return false;
++	}
++}
++
++uint32_t
++sweet_a618_fence_last(void)
++{
++	return a618_dev.seqno;
++}
++
++/* The CP wrote this sequence number (or a later one) to the fence word; polling only. */
++bool
++sweet_a618_fence_done(uint32_t fence)
++{
++	if (!cp_memory) {
++		return false;
++	}
++	vm_offset_t word = cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE;
++	sweet_dma_sync_va((const void *)word, sizeof(uint32_t));
++	uint32_t v = *(volatile uint32_t *)word;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return (int32_t)(v - fence) >= 0;
++}
++
++/* What the CP says when a submission does not come back. */
++void
++sweet_a618_report(const char *why)
++{
++	uint32_t done = cp_memory ? *(volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE) : 0;
++
++	printf("SWEET GPU: %s: submitted %u, completed %u, ring WPTR %u\n", why, a618_dev.seqno, done, cp_ring_wptr);
++	if (cp_memory) {
++		/* the last submission: 2 CCU events (4 dwords), CP_INDIRECT_BUFFER (4) and the fence event (5) */
++		const volatile uint32_t *rg = (const volatile uint32_t *)(cp_memory + CP_RING_OFF);
++		const unsigned rn = CP_RING_BYTES / 4, rw = cp_ring_wptr;
++#define A618_RG(k) rg[(rw + rn - (k)) % rn]
++		printf("SWEET GPU: %s: last ring dwords %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", why,
++		    A618_RG(13), A618_RG(12), A618_RG(11), A618_RG(10), A618_RG(9), A618_RG(8), A618_RG(7), A618_RG(6), A618_RG(5),
++		    A618_RG(4), A618_RG(3), A618_RG(2), A618_RG(1));
++#undef A618_RG
++	}
++	if (a618_regs_safe()) {
++		printf("SWEET GPU: %s: ring RPTR %u RBBM_STATUS %#x CP_STATUS_1 %#x HW_FAULT %#x CP_IRQ %#x PROTECT %#x RBBM_IRQ %#x\n",
++		    why, gpu_rd(a618_gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(a618_gpu, A6XX_RBBM_STATUS * 4),
++		    gpu_rd(a618_gpu, A6XX_CP_STATUS_1 * 4), gpu_rd(a618_gpu, A6XX_CP_HW_FAULT * 4),
++		    gpu_rd(a618_gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(a618_gpu, A6XX_CP_PROTECT_STATUS * 4),
++		    gpu_rd(a618_gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	} else {
++		printf("SWEET GPU: %s: GPU registers not read (GX off or AHB fence closed)\n", why);
++	}
++	if (a618_smmu) {
++		vm_offset_t b = a618_smmu + SMMU_CB(CP_CB);
++		printf("SWEET GPU: %s: SMMU CB%u FSR %#x FAR %#x%08x FSYNR0 %#x, global GFSR %#x\n", why, CP_CB,
++		    gpu_rd(b, SMMU_CB_FSR), gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0),
++		    gpu_rd(a618_smmu, SMMU_sGFSR));
++	}
++	sweet_log_sync();
++}
++
++/* The GPU stopped answering; no recovery is attempted: nothing more is submitted. */
++void
++sweet_a618_mark_lost(void)
++{
++	if (!a618_dev.lost) {
++		a618_dev.lost = true;
++		a618_dev.hangs++;
++		sweet_a618_report("GPU LOST (no completion)");
++	}
++}
++
++/* A translation fault of context bank 1: log, clear, declare the GPU lost (the CP stays wedged on the access). */
++static bool
++a618_check_fault(void)
++{
++	vm_offset_t b = a618_smmu + SMMU_CB(CP_CB);
++	uint32_t fsr = gpu_rd(b, SMMU_CB_FSR);
++
++	if (!(fsr & A618_SMMU_FAULT_BITS)) {
++		if (fsr) {
++			gpu_wr(b, SMMU_CB_FSR, fsr);    /* stale status bits (0x400 from boot) */
++		}
++		return false;
++	}
++	printf("SWEET GPU: SMMU CB%u FAULT: FSR %#x FAR %#x%08x FSYNR0 %#x\n", CP_CB, fsr,
++	    gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0));
++	gpu_wr(b, SMMU_CB_FSR, fsr);
++	if (!a618_dev.lost) {
++		a618_dev.lost = true;
++		a618_dev.hangs++;
++		sweet_a618_report("GPU LOST (SMMU fault)");
++	}
++	return true;
++}
++
++/*
++ * One submission: invalidate the CCU (2 events), one CP_INDIRECT_BUFFER per IB (address lo/hi, size in dwords), then
++ * CACHE_FLUSH_TS writing the new sequence number to the fence word (the tail of Linux a6xx_submit). The context's TLB is
++ * invalidated first (sweet_a618_vm_map does not do it). Returns the sequence number, or 0 when refused: not ready,
++ * lost, bad arguments, GX off, an SMMU fault, or no ring room for 2 s (which also marks the GPU lost).
++ */
++uint32_t
++sweet_a618_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
++{
++	unsigned need = 18 + 4 * count, room = 0;
++
++	if (!sweet_a618_ready() || !ib_iova || !ib_dwords || count == 0 || count > A618_MAX_IBS) {
++		return 0;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		/* an IB must lie in the client range (never the ring, SQE or scratch) and fit the 20-bit size field */
++		if ((ib_iova[i] & 3) || ib_iova[i] < A618_GVM_BASE || ib_dwords[i] == 0 || ib_dwords[i] >= (1u << 20) ||
++		    ib_iova[i] + 4ull * ib_dwords[i] > A618_GVM_END) {
++			return 0;
++		}
++	}
++	if (!(gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) || (gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF)) {
++		sweet_a618_report("submit refused: GX is off");
++		return 0;
++	}
++	if (a618_check_fault()) {
++		return 0;
++	}
++	if (gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL) != 0) {
++		printf("SWEET GPU: submit: AHB fence was %#x (not ALLOW); set to ALLOW\n", gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL));
++		gpu_wr(gmu, GMU_AO_AHB_FENCE_CTRL, 0);
++	}
++	for (unsigned i = 0; i < 20000; i++) {
++		uint32_t rptr = gpu_rd(a618_gpu, A6XX_CP_RB_RPTR * 4);
++		room = (rptr + CP_RING_BYTES / 4 - cp_ring_wptr - 1) % (CP_RING_BYTES / 4);
++		if (room >= need) {
++			break;
++		}
++		delay(100);
++	}
++	if (room < need) {
++		sweet_a618_mark_lost();
++		return 0;
++	}
++	a618_tlb_flush();
++	if (++a618_dev.seqno == 0) {
++		a618_dev.seqno = 1;
++	}
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
++	cp_ring_emit(A618_PC_CCU_INVALIDATE_DEPTH);
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
++	cp_ring_emit(A618_PC_CCU_INVALIDATE_COLOR);
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 1));
++	cp_ring_emit(A618_CACHE_INVALIDATE);
++	for (unsigned i = 0; i < count; i++) {
++		cp_ring_emit(cp_pkt7(CP_INDIRECT_BUFFER, 3));
++		cp_ring_emit((uint32_t)ib_iova[i]);
++		cp_ring_emit((uint32_t)(ib_iova[i] >> 32));
++		cp_ring_emit(ib_dwords[i]);
++	}
++	cp_ring_emit(cp_pkt7(CP_EVENT_WRITE, 4));
++	cp_ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	cp_ring_emit((uint32_t)(CP_SCRATCH_VA + A618_SCRATCH_FENCE));
++	cp_ring_emit(0);
++	cp_ring_emit(a618_dev.seqno);
++	cp_ring_flush(a618_gpu);
++	a618_dev.submissions++;
++	return a618_dev.seqno;
++}
++
++/* Fire the ready hook once, as soon as the self-test passed and a hook is set (either order, no lock). */
++static void
++a618_try_hook(void)
++{
++	void (*hook)(void) = __atomic_load_n(&sweet_a618_ready_hook, __ATOMIC_SEQ_CST);
++
++	if (__atomic_load_n(&a618_published, __ATOMIC_SEQ_CST) && hook != NULL &&
++	    __atomic_exchange_n(&a618_hook_fired, 1, __ATOMIC_SEQ_CST) == 0) {
++		printf("SWEET GPU: API core ready: calling the ready hook\n");
++		sweet_log_sync();
++		hook();
++	}
++}
++
++/* Set the ready hook; calls it right away (in the caller's context) when the core is already published. */
++void
++sweet_a618_set_ready_hook(void (*hook)(void))
++{
++	__atomic_store_n(&sweet_a618_ready_hook, hook, __ATOMIC_SEQ_CST);
++	a618_try_hook();
++}
++
++/*
++ * API self-test (no IOKit): two kernel pages (16 KiB each, WCOMB) are mapped at iovas from sweet_a618_iova_alloc, one with
++ * the first_store shader, its UAV descriptor and the command stream, the other as the shader's target. The stream is
++ * cs_ib of gpu_cp_dispatch_test relocated at run time: its hard-coded VAs (shader 0x40022000, descriptor 0x40022400,
++ * timestamp 0x40020160) are replaced by the new ones, the descriptor's buffer address (dword 4) points at the target.
++ * It runs twice through sweet_a618_submit + sweet_a618_fence_done and expects dword 0 of the target to become
++ * 0xcafe0001 and the stream's own CACHE_FLUSH_TS word to become CS_TS_SEQ, then unmaps, frees and checks that the iova
++ * list coalesced back to the full window.
++ */
++#define A618_ST_SHADER_OFF      0x0u            /* in the code page */
++#define A618_ST_DESC_OFF        0x400u
++#define A618_ST_IB_OFF          0x1000u
++#define A618_ST_TS_OFF          0x100u          /* in the data page; the target is dword 0 of it */
++#define A618_ST_ROUNDS          2
++#define A618_ST_OLD_SHADER_VA   0x40022000u     /* constants of cs_ib to relocate */
++#define A618_ST_OLD_DESC_VA     0x40022400u
++#define A618_ST_OLD_TS_VA       0x40020160u
++
++static bool
++a618_selftest(void)
++{
++	const char *err = NULL;
++	vm_offset_t kva = 0;
++	uint64_t pa = 0, iova_code = 0, iova_data = 0, taken_code = 0, taken_data = 0;
++	uint32_t fences[A618_ST_ROUNDS] = { 0 };
++	uint32_t last_target = 0, last_ts = 0;
++	bool mapped = false;
++	unsigned ib_dw = (unsigned)(sizeof(cs_ib) / sizeof(cs_ib[0])), hit_shader = 0, hit_desc = 0, hit_ts = 0;
++	uint32_t ib[sizeof(cs_ib) / sizeof(cs_ib[0])];
++
++	printf("SWEET GPU: API selftest: starting (2 x %u-dword compute dispatch through the sweet_a618_* API)\n", ib_dw);
++	sweet_log_sync();
++	do {
++		if (!a618_dma_alloc(2 * PAGE_SIZE, &kva, &pa)) {
++			err = "no memory for the two test pages";
++			break;
++		}
++		if (!sweet_a618_iova_alloc(PAGE_SIZE, &iova_code, &taken_code) ||
++		    !sweet_a618_iova_alloc(PAGE_SIZE, &iova_data, &taken_data)) {
++			err = "sweet_a618_iova_alloc failed";
++			break;
++		}
++		mapped = true;         /* unmap below is harmless for pages that were not mapped */
++		for (uint64_t off = 0; off < PAGE_SIZE; off += 0x1000) {
++			if (!sweet_a618_vm_map(iova_code + off, pa + off, false) ||
++			    !sweet_a618_vm_map(iova_data + off, pa + PAGE_SIZE + off, false)) {
++				err = "sweet_a618_vm_map failed";
++				break;
++			}
++		}
++		if (err) {
++			break;
++		}
++		for (unsigned i = 0; i < ib_dw; i++) {
++			uint32_t v = cs_ib[i];
++			if (v == A618_ST_OLD_SHADER_VA) {
++				v = (uint32_t)iova_code + A618_ST_SHADER_OFF;
++				hit_shader++;
++			} else if (v == A618_ST_OLD_DESC_VA) {
++				v = (uint32_t)iova_code + A618_ST_DESC_OFF;
++				hit_desc++;
++			} else if (v == A618_ST_OLD_TS_VA) {
++				v = (uint32_t)iova_data + A618_ST_TS_OFF;
++				hit_ts++;
++			}
++			ib[i] = v;
++		}
++		if (hit_shader != 2 || hit_desc != 2 || hit_ts != 1 || cs_uav_desc[4] != 0x40022800u) {
++			err = "command stream relocation did not match the generated stream";
++			break;
++		}
++		volatile uint32_t *code = (volatile uint32_t *)kva, *data = (volatile uint32_t *)(kva + PAGE_SIZE);
++		for (unsigned i = 0; i < sizeof(cs_shader) / 4; i++) {
++			code[A618_ST_SHADER_OFF / 4 + i] = cs_shader[i];
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			code[A618_ST_DESC_OFF / 4 + i] = cs_uav_desc[i];
++		}
++		code[A618_ST_DESC_OFF / 4 + 4] = (uint32_t)iova_data;   /* the UAV buffer: dword 0 of the data page */
++		for (unsigned i = 0; i < ib_dw; i++) {
++			code[A618_ST_IB_OFF / 4 + i] = ib[i];
++		}
++		for (unsigned round = 0; round < A618_ST_ROUNDS && !err; round++) {
++			for (unsigned i = 0; i < 4; i++) {
++				data[i] = 0xdeadbee0u + i;
++			}
++			data[A618_ST_TS_OFF / 4] = 0;
++			sweet_a618_cache_sync((void *)kva, 2 * PAGE_SIZE);
++			uint64_t ib_va = iova_code + A618_ST_IB_OFF;
++			uint32_t fence = sweet_a618_submit(&ib_va, &ib_dw, 1);
++			if (fence == 0) {
++				err = "sweet_a618_submit refused the dispatch";
++				break;
++			}
++			fences[round] = fence;
++			unsigned i;
++			for (i = 0; i < 10000 && !sweet_a618_fence_done(fence); i++) {
++				delay(100);
++			}
++			if (i == 10000) {
++				sweet_a618_report("API selftest: fence timeout");
++				err = "fence did not complete within 1 s";
++				break;
++			}
++			for (i = 0; i < 10000 && (data[0] != 0xcafe0001u || data[A618_ST_TS_OFF / 4] != CS_TS_SEQ); i++) {
++				sweet_a618_cache_sync((void *)(kva + PAGE_SIZE), 0x200);
++				delay(10);
++			}
++			last_target = data[0];
++			last_ts = data[A618_ST_TS_OFF / 4];
++			printf("SWEET GPU: API selftest: round %u fence %u done, target %#x (want 0xcafe0001), ts %#x (want %#x)\n",
++			    round + 1, fence, last_target, last_ts, CS_TS_SEQ);
++			if (last_target != 0xcafe0001u || last_ts != CS_TS_SEQ) {
++				err = "target or timestamp word wrong after the fence";
++			}
++		}
++		if (err) {
++			break;
++		}
++		if (fences[1] != fences[0] + 1 || sweet_a618_fence_last() != fences[1]) {
++			err = "fence numbers not consecutive";
++		}
++	} while (0);
++	if (mapped) {
++		sweet_a618_vm_unmap(iova_code, taken_code);
++		sweet_a618_vm_unmap(iova_data, taken_data);
++	}
++	if (taken_data) {
++		sweet_a618_iova_free(iova_data, taken_data);
++	}
++	if (taken_code) {
++		sweet_a618_iova_free(iova_code, taken_code);
++	}
++	/* with VA recycling off (default) the ranges are not returned: only the mapping count can be checked */
++	if (!err && (a618_dev.bytes_mapped != 0 || (a618_recycle_va && (a618_nfree != 1 || a618_free[0].start != A618_GVM_BASE ||
++	    a618_free[0].size != A618_GVM_END - A618_GVM_BASE)))) {
++		err = "unmap/free left mappings or a fragmented iova list";
++	}
++	if (err) {
++		printf("SWEET GPU: API selftest FAILED: %s (fences %u %u, target %#x, ts %#x, mapped %llu, free ranges %u)\n", err,
++		    fences[0], fences[1], last_target, last_ts, a618_dev.bytes_mapped, a618_nfree);
++		a618_dev.ready = false;         /* nothing is published; the GPU stays up until reset */
++	} else {
++		printf("SWEET GPU: API selftest PASSED: %u dispatches through iova_alloc/vm_map/submit/fence_done, fences %u %u, unmap and free clean\n",
++		    A618_ST_ROUNDS, fences[0], fences[1]);
++	}
++	sweet_log_sync();
++	return err == NULL;
++}
++
++static void
++a618_selftest_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	if (a618_selftest()) {
++		__atomic_store_n(&a618_published, 1, __ATOMIC_SEQ_CST);
++		a618_try_hook();
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * sweetgpu=11, after gpu_gx_test left the GPU up (GX on, OOB_GPU and OOB_BOOT_SLUMBER held exactly as in the proven
++ * sweetgpukeep=1 state, zap running, SQE running, ring idle): set up the client address space and the fence word, then
++ * start the self-test thread. No keep-alive thread and no shutdown: the GPU stays up until reset.
++ */
++static void
++a618_core_start(void)
++{
++	thread_t thread;
++
++	a618_gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	a618_smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!a618_gpu || !a618_smmu || !cp_memory || !cp_memory_pa || !gpu_cp_context_intact(a618_smmu)) {
++		printf("SWEET GPU: API core: prerequisites missing; not started (GPU stays up until reset)\n");
++		sweet_log_sync();
++		return;
++	}
++	a618_ptp_pages = A618_PTP_PAGES;
++	if (!a618_dma_alloc((vm_size_t)a618_ptp_pages * A618_PTP_TABLE, &a618_ptp, &a618_ptp_pa)) {
++		a618_ptp_pages = A618_PTP_PAGES_MIN;
++		if (!a618_dma_alloc((vm_size_t)a618_ptp_pages * A618_PTP_TABLE, &a618_ptp, &a618_ptp_pa)) {
++			a618_ptp = 0;
++			printf("SWEET GPU: API core: no memory for the GPU page-table pool; not started\n");
++			sweet_log_sync();
++			return;
++		}
++	}
++	a618_ptp_used = 0;
++	a618_free[0].start = A618_GVM_BASE;
++	a618_free[0].size = A618_GVM_END - A618_GVM_BASE;
++	a618_nfree = 1;
++	*(volatile uint32_t *)(cp_memory + CP_SCRATCH_OFF + A618_SCRATCH_FENCE) = 0;
++	flush_dcache64((addr64_t)(cp_memory_pa + CP_SCRATCH_OFF), 0x200, TRUE);
++	a618_dev.seqno = 0;
++	a618_dev.ready = true;
++	printf("SWEET GPU: API core: GPU kept up (OOB_GPU held), ring %u dwords at RPTR=WPTR=%u, client VA %#llx-%#llx, %u table pages\n",
++	    CP_RING_BYTES / 4, cp_ring_wptr, A618_GVM_BASE, A618_GVM_END, a618_ptp_pages);
++	sweet_log_sync();
++	if (kernel_thread_start(a618_selftest_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GPU: API core: kernel_thread_start failed; running the self-test inline\n");
++		if (a618_selftest()) {
++			__atomic_store_n(&a618_published, 1, __ATOMIC_SEQ_CST);
++			a618_try_hook();
++		}
++	}
++}
++
++static void
++gpu_keep_thread(void *arg, wait_result_t result)
++{
++	const unsigned rounds = 6;
++	unsigned passed = 0;
++	bool ib_ok = false, cs_ok = false;
++	(void)arg;
++	(void)result;
++	for (unsigned r = 1; r <= rounds; r++) {
++		uint64_t deadline;
++		clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&gpu_keep_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		if (r == 1) {
++			ib_ok = gpu_cp_ib_test();
++			cs_ok = gpu_cp_dispatch_test();
++		}
++		if (gpu_cp_repeat(r)) {
++			passed++;
++		} else {
++			break;
++		}
++	}
++	printf("SWEET GPU: KEEP %u of %u rounds passed, IB test %s, shader dispatch %s; shutting the GPU down\n", passed, rounds,
++	    ib_ok ? "PASSED" : "FAILED", cs_ok ? "PASSED" : "FAILED");
++	sweet_log_sync();
++	bool zap = sweet_scm_zap_shutdown();
++	vm_offset_t g = ml_io_map(GPU_PA, GPU_SIZE);
++	if (g) {
++		gpu_wr(g, A6XX_CP_SQE_CNTL * 4, 0);
++	}
++	gmu_oob_clear(OOB_GPU);
++	gmu_oob_clear(OOB_BOOT_SLUMBER);
++	gpu_gx_slumber();
++	gpu_gmu_reset();
++	printf("SWEET GPU: KEEP shutdown done (zap %s)\n", zap ? "complete" : "failed");
++	sweet_log_sync();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++gpu_keep_start(void)
++{
++	thread_t thread;
++	printf("SWEET GPU: KEEP: GPU left up after the first test, rounds every 15 s\n");
++	sweet_log_sync();
++	if (kernel_thread_start(gpu_keep_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GPU: KEEP: kernel_thread_start failed; GPU stays up until reset\n");
++	}
 +}
 +
 +/* Cold boot; with hold, the GMU is put back into reset after reporting. */
@@ -2151,7 +3800,15 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +			gx = rail && gpu_sptprac(true);
 +		}
 +		if (booted && (mode < 6 || gx) && gpu_hfi_start() && mode >= 6) {
-+			if (!gpu_gx_test(mode >= 7, mode >= 9)) {
++			if (!gpu_gx_test(mode >= 7, mode >= 9, mode >= 10, mode >= 11)) {
++				return;
++			}
++			if (gpu_kept) {
++				if (mode >= 11) {
++					a618_core_start();    /* permanent core + sweet_a618_* API */
++				} else {
++					gpu_keep_start();
++				}
 +				return;
 +			}
 +		} else if (rail) {
@@ -2178,6 +3835,7 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +	clock_interval_to_deadline((uint32_t)(uintptr_t)arg, NSEC_PER_SEC, &deadline);
 +	(void)assert_wait_deadline(&sweet_gpu_sleep_chan, THREAD_UNINT, deadline);
 +	thread_block(THREAD_CONTINUE_NULL);
++	sweet_scm_probe();
 +	sweet_gpu_run();
 +	sweet_log_sync();
 +	(void)thread_terminate(current_thread());
@@ -2203,7 +3861,435 @@ Subject: [PATCH] surya: Adreno 618 bring-up (sweetgpu=1..6, sweetgpudelay=N), dr
 +		}
 +		printf("SWEET GPU: kernel_thread_start failed; probing now\n");
 +	}
++	sweet_scm_probe();
 +	sweet_gpu_run();
 +}
 +
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_scm.c b/bsd/dev/sweet_scm.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_scm.c
+@@ -0,0 +1,410 @@
++/*
++ * SWEET: Qualcomm SCM availability queries, opt-in with sweetscm=1.
++ *
++ * Protocol reference: this phone's LineageOS drivers/soc/qcom/scm.c
++ * (is_scm_armv8, scm_is_call_available, __scm_call_armv8_64) and Linux
++ * drivers/firmware/qcom/qcom_scm-smc.c (QCOM_A6 continuation quirk).
++ * sweetscm=1 performs INFO/IS_CALL_AVAIL and PIL/PAS_IS_SUPPORTED queries.
++ * sweetscm=2 also reports crypto-path BCM descriptors and GCC clock state.
++ * sweetscm=3 adds crypto bandwidth votes only (held until reset).
++ * sweetscm=4 prepares signed zap loading; sweetgpu=7 invokes it with GX on.
++ * The test requests PAS shutdown before normal GPU slumber; buffers remain pinned.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "sweet_rpmh.h"
++
++extern void sweet_log_sync(void);
++void sweet_scm_probe(void);
++bool sweet_scm_gpu_zap_test(void);
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SCM_SIP                  0x02000000u
++#define SCM_64                   0x40000000u
++#define SCM_FAST                 0x80000000u
++#define SCM_INFO_AVAIL           (SCM_SIP | 0x0601u)
++#define SCM_PAS_SUPPORTED        (SCM_SIP | 0x0207u)
++#define SCM_PAS_GPU              13u
++#define SCM_INTERRUPTED          1
++#define SCM_BUSY                 (-12)
++#define SCM_RESUME_LIMIT         64u
++#define SCM_BUSY_LIMIT           3u
++
++struct scm_regs {
++	uint64_t a[7];
++};
++
++/* Preserve x6 returned by Qualcomm's firmware across interrupted calls. */
++#if defined(SWEET_SCM_TEST)
++static void scm_smccc(struct scm_regs *r);
++#else
++static void
++scm_smccc(struct scm_regs *r)
++{
++	register uint64_t x0 __asm__("x0") = r->a[0];
++	register uint64_t x1 __asm__("x1") = r->a[1];
++	register uint64_t x2 __asm__("x2") = r->a[2];
++	register uint64_t x3 __asm__("x3") = r->a[3];
++	register uint64_t x4 __asm__("x4") = r->a[4];
++	register uint64_t x5 __asm__("x5") = r->a[5];
++	register uint64_t x6 __asm__("x6") = r->a[6];
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++	    : : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	*r = (struct scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
++}
++#endif
++
++static bool
++scm_invoke(const struct scm_regs *initial, bool fast, struct scm_regs *out)
++{
++	for (unsigned busy = 0; busy <= SCM_BUSY_LIMIT; busy++) {
++		*out = *initial;
++		for (unsigned resume = 0; ; resume++) {
++			scm_smccc(out);
++			if ((int32_t)out->a[0] != SCM_INTERRUPTED) {
++				break;
++			}
++			if (resume == SCM_RESUME_LIMIT) {
++				printf("SWEET SCM: interrupted query did not complete; no further queries\n");
++				return false;
++			}
++			/* Firmware returned x0=1 and a continuation token in x6. */
++		}
++		if ((int32_t)out->a[0] != SCM_BUSY) {
++			return true;
++		}
++		if (fast || busy == SCM_BUSY_LIMIT) {
++			printf("SWEET SCM: query busy; no further queries\n");
++			return false;
++		}
++		delay(30000);
++	}
++	return false;
++}
++
++static bool
++scm_query(uint32_t fn, uint32_t arg, bool fast, struct scm_regs *out)
++{
++	const struct scm_regs initial = { { fn, 1, arg, 0, 0, 0, 0 } };
++	return scm_invoke(&initial, fast, out);
++}
++
++static bool
++scm_logged_query(const char *name, uint32_t fn, uint32_t arg, bool fast, struct scm_regs *r)
++{
++	printf("SWEET SCM: %s fn=%#x arg=%#x\n", name, fn, arg);
++	sweet_log_sync();
++	bool done = scm_query(fn, arg, fast, r);
++	printf("SWEET SCM: %s completed=%u status=%d result=%#llx/%#llx/%#llx\n",
++	    name, done, (int32_t)r->a[0], r->a[1], r->a[2], r->a[3]);
++	sweet_log_sync();
++	return done;
++}
++
++/* Recovery live FDT: master 125 (crypto) -> slave 512 (DDR), deduplicated BCMs. */
++static void
++scm_crypto_resources(void)
++{
++	static const char *const names[] = { "CE0", "SN11", "SN0", "SH0", "MC0", "ACV" };
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
++		struct sweet_rpmh_bcm b;
++		int error = sweet_rpmh_bcm_info(names[i], &b);
++		if (error) {
++			printf("SWEET SCM: BCM %s lookup failed errno=%d\n", names[i], error);
++			continue;
++		}
++		printf("SWEET SCM: BCM %s addr=%#x unit=%u width=%u vcd=%u reserved=%u version=%#x\n",
++		    names[i], b.address, b.unit, b.width, b.vcd, b.reserved, b.version);
++	}
++	/* GCC is always accessible; do not read the potentially gated CE itself. */
++	vm_offset_t gcc = ml_io_map(0x00100000u, 0x90000u);
++	if (gcc) {
++		static const uint32_t offsets[] = { 0x41004u, 0x41008u, 0x4100cu, 0x52004u };
++		static const char *const clocks[] = { "core", "axi", "ahb", "shared_vote" };
++		for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
++			uint32_t v = *(volatile uint32_t *)(gcc + offsets[i]);
++			__asm__ volatile("dmb oshld" ::: "memory");
++			printf("SWEET SCM: CE1 %s GCC+%#x = %#x\n", clocks[i], offsets[i], v);
++		}
++	} else {
++		printf("SWEET SCM: GCC mapping failed\n");
++	}
++	sweet_log_sync();
++}
++
++static bool scm_zap_ready, scm_zap_attempted;
++#define ZAP_ALLOC_SIZE 0x100000u
++#define ZAP_LOGICAL_SIZE 0x1000u
++#define ZAP_FIXED_PA 0x97715000u        /* DT sm7150.dtsi gpu_mem: gpu@97715000, no-map, 0x2000 (Run D) */
++#define ZAP_FIXED_SIZE 0x2000u
++
++/* ELF32 little endian, byte accesses also accept an unaligned ADT property. */
++static uint32_t
++zap_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static uint16_t
++zap_u16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++/* Narrow a615_zap format: header + hash metadata, one relocatable code blob. */
++static bool
++zap_valid(const uint8_t *mdt, unsigned size, const uint8_t *code, unsigned code_size)
++{
++	if (!mdt || !code || size <= 148 || size > 8192 || !code_size || code_size > 4096 ||
++	    zap_u32(mdt) != 0x464c457f || mdt[4] != 1 || mdt[5] != 1 || mdt[6] != 1 ||
++	    zap_u16(mdt + 16) != 2 || zap_u16(mdt + 18) != 164 || zap_u32(mdt + 20) != 1 ||
++	    zap_u32(mdt + 24) != 0x5000 || zap_u32(mdt + 28) != 52 ||
++	    zap_u16(mdt + 40) != 52 || zap_u16(mdt + 42) != 32 || zap_u16(mdt + 44) != 3) {
++		return false;
++	}
++	const uint8_t *header = mdt + 52, *hash = header + 32, *load = hash + 32;
++	return zap_u32(header) == 0 && zap_u32(header + 4) == 0 &&
++	       zap_u32(header + 16) == 148 && zap_u32(header + 20) == 0 &&
++	       zap_u32(hash) == 0 && zap_u32(hash + 4) == 0x1000 &&
++	       zap_u32(hash + 12) == 0x6000 && zap_u32(hash + 16) == size - 148 &&
++	       zap_u32(hash + 20) == 0x2000 && zap_u32(hash + 24) == 0x02200000 &&
++	       zap_u32(load) == 1 && zap_u32(load + 4) == 0x3000 &&
++	       zap_u32(load + 12) == 0x5000 && zap_u32(load + 16) == code_size &&
++	       zap_u32(load + 20) == code_size && zap_u32(load + 24) == 0x08000007 &&
++	       zap_u32(load + 28) == ZAP_ALLOC_SIZE;
++}
++
++enum zap_result { ZAP_OK, ZAP_ERROR, ZAP_UNFINISHED };
++static enum zap_result
++zap_call(const char *name, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2)
++{
++	struct scm_regs r;
++	const struct scm_regs initial = {
++		{ SCM_64 | SCM_SIP | 0x0200u | cmd, arginfo, SCM_PAS_GPU, arg1, arg2, 0, 0 }
++	};
++	printf("SWEET SCM: zap %s fn=%#llx info=%#x args=%#llx/%#llx/%#llx\n",
++	    name, initial.a[0], arginfo, initial.a[2], arg1, arg2);
++	sweet_log_sync();
++	__asm__ volatile("dsb sy" ::: "memory");
++	bool done = scm_invoke(&initial, false, &r);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET SCM: zap %s completed=%u status=%d result=%d\n",
++	    name, done, (int32_t)r.a[0], (int32_t)r.a[1]);
++	sweet_log_sync();
++	if (!done) {
++		return ZAP_UNFINISHED;
++	}
++	return (int32_t)r.a[0] == 0 && (int32_t)r.a[1] == 0 ? ZAP_OK : ZAP_ERROR;
++}
++
++bool (*sweet_scm_zap_running_hook)(void);   /* set by sweet_gpu.c for sweetgpu=10 */
++bool sweet_scm_zap_keep;                     /* sweetgpukeep=1: leave the zap running after the test */
++bool sweet_scm_zap_shutdown(void);
++
++/* Return true only if PAS never started or a completed shutdown quiesced it. */
++bool
++sweet_scm_gpu_zap_test(void)
++{
++	if (!scm_zap_ready || scm_zap_attempted) {
++		printf("SWEET SCM: zap test not ready or already attempted\n");
++		return !scm_zap_attempted;
++	}
++	scm_zap_attempted = true;
++	DTEntry node;
++	const uint8_t *mdt = NULL, *code = NULL;
++	unsigned mdt_size = 0, code_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "zap-mdt", (const void **)&mdt, &mdt_size) != kSuccess ||
++	    SecureDTGetProperty(node, "zap-b02", (const void **)&code, &code_size) != kSuccess ||
++	    !zap_valid(mdt, mdt_size, code, code_size)) {
++		printf("SWEET SCM: missing or unsupported a615_zap metadata/code\n");
++		return true;
++	}
++	/* Run D (sweetzapfixed=1): the image goes into the firmware's reserved gpu_mem carve-out, as Linux does;
++	 * the metadata always lives in owned kernel pages. Default: one aligned, owned MiB for both. */
++	int fixed = 0;
++	PE_parse_boot_argn("sweetzapfixed", &fixed, sizeof(fixed));
++	vm_offset_t kva = 0, md_kva;
++	uint64_t pa, md_pa;
++	volatile uint32_t *fixed_img = NULL;
++	const vm_size_t md_bytes = round_page(mdt_size);
++	const vm_size_t bytes = fixed ? md_bytes : ZAP_ALLOC_SIZE + PAGE_SIZE;
++	if (kmem_alloc_contig(kernel_map, &kva, bytes, fixed ? PAGE_MASK : ZAP_ALLOC_SIZE - 1, 0,
++	    fixed ? 0 : (ZAP_ALLOC_SIZE >> PAGE_SHIFT) - 1,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET SCM: zap contiguous allocation failed\n");
++		return true;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	uint64_t apa = ptoa_64(pn);
++	if (!pn || (!fixed && (apa & (ZAP_ALLOC_SIZE - 1)))) {
++		printf("SWEET SCM: zap invalid allocation PA/alignment\n");
++		return true;
++	}
++	for (unsigned i = 0; i < bytes / PAGE_SIZE; ++i) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			printf("SWEET SCM: zap allocation not physically contiguous\n");
++			return true;
++		}
++	}
++	for (unsigned i = 0; i < bytes / PAGE_SIZE; ++i) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	flush_dcache64((addr64_t)apa, bytes, TRUE);
++	if (fixed) {
++		pa = ZAP_FIXED_PA;
++		md_kva = kva;
++		md_pa = apa;
++		fixed_img = (volatile uint32_t *)ml_io_map(pa, ZAP_FIXED_SIZE);
++		if (!fixed_img) {
++			printf("SWEET SCM: zap fixed region %#llx not mappable\n", pa);
++			return true;
++		}
++		for (unsigned i = 0; i < ZAP_FIXED_SIZE / 4; ++i) {
++			fixed_img[i] = 0;
++		}
++	} else {
++		pa = apa;
++		md_kva = kva + ZAP_ALLOC_SIZE;
++		md_pa = apa + ZAP_ALLOC_SIZE;
++	}
++	memcpy((void *)md_kva, mdt, mdt_size);
++	printf("SWEET SCM: zap owned image=%#llx (%s) allocation=%#x logical=%#x metadata=%#llx/%u code=%u\n",
++	    pa, fixed ? "fixed gpu_mem carve-out" : "kernel RAM", fixed ? ZAP_FIXED_SIZE : ZAP_ALLOC_SIZE, ZAP_LOGICAL_SIZE,
++	    md_pa, mdt_size, code_size);
++	/* SCM_ARGS(2, VAL, RW) = 2 | (2 << 6) = 0x82. Monitor verifies signatures. */
++	enum zap_result result = zap_call("INIT_IMAGE", 1, 0x82, md_pa, 0);
++	if (result != ZAP_OK) {
++		return result == ZAP_ERROR;
++	}
++	result = zap_call("MEM_SETUP", 2, 3, pa, ZAP_LOGICAL_SIZE);
++	if (result == ZAP_OK) {
++		if (fixed) {
++			for (unsigned i = 0; i < code_size / 4; ++i) {
++				fixed_img[i] = ((const uint32_t *)(const void *)code)[i];
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("SWEET SCM: zap code written to %#llx, first words %08x %08x\n", pa, fixed_img[0], fixed_img[1]);
++		} else {
++			memcpy((void *)kva, code, code_size);
++		}
++		result = zap_call("AUTH_AND_RESET", 5, 1, 0, 0);
++		if (result == ZAP_OK) {
++			printf("SWEET SCM: signed zap authenticated and started\n");
++			sweet_log_sync();
++			if (sweet_scm_zap_running_hook) {
++				(void)sweet_scm_zap_running_hook();
++			}
++		}
++	}
++	/* An unfinished secure operation gets no new calls, frees, or collapse. */
++	if (result == ZAP_UNFINISHED) {
++		return false;
++	}
++	if (sweet_scm_zap_keep && result == ZAP_OK) {
++		printf("SWEET SCM: zap kept running (sweetgpukeep=1); sweet_scm_zap_shutdown() ends it\n");
++		sweet_log_sync();
++		return true;
++	}
++	return sweet_scm_zap_shutdown();
++}
++
++bool
++sweet_scm_zap_shutdown(void)
++{
++	bool stopped = zap_call("SHUTDOWN", 6, 1, 0, 0) == ZAP_OK;
++	printf("SWEET SCM: zap test shutdown=%s; allocation retained until reset\n", stopped ? "complete" : "failed");
++	sweet_log_sync();
++	return stopped;
++}
++
++void
++sweet_scm_probe(void)
++{
++	int enabled = 0;
++	struct scm_regs r;
++	PE_parse_boot_argn("sweetscm", &enabled, sizeof(enabled));
++	if (enabled < 1 || enabled > 4) {
++		return;
++	}
++
++	/* Same convention detection as the phone's is_scm_armv8(). */
++	uint32_t mask = SCM_64;
++	if (!scm_logged_query("SMC64 convention", SCM_FAST | mask | SCM_INFO_AVAIL,
++	    SCM_FAST | SCM_INFO_AVAIL, true, &r)) {
++		return;
++	}
++	if ((int32_t)r.a[0] != 0 || r.a[1] == 0) {
++		/* Only an unsupported convention is a reason to try SMC32. */
++		if ((int32_t)r.a[0] != -1 && (int32_t)r.a[0] != 0) {
++			return;
++		}
++		mask = 0;
++		if (!scm_logged_query("SMC32 convention", SCM_FAST | SCM_INFO_AVAIL,
++		    SCM_FAST | SCM_INFO_AVAIL, true, &r) || (int32_t)r.a[0] != 0 || r.a[1] == 0) {
++			printf("SWEET SCM: no ARMv8 SCM convention; legacy ABI not attempted\n");
++			return;
++		}
++	}
++	printf("SWEET SCM: selected SMC%u\n", mask ? 64 : 32);
++
++	static const struct {
++		const char *name;
++		uint32_t cmd;
++	} queries[] = {
++		{ "PAS_INIT_IMAGE available", 1 },
++		{ "PAS_MEM_SETUP available", 2 },
++		{ "PAS_AUTH_AND_RESET available", 5 },
++		{ "PAS_SHUTDOWN available", 6 },
++		{ "PAS_IS_SUPPORTED available", 7 },
++	};
++	uint32_t available = 0;
++	for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
++		uint32_t target = SCM_SIP | 0x0200u | queries[i].cmd;
++		if (!scm_logged_query(queries[i].name, mask | SCM_INFO_AVAIL, target, false, &r) ||
++		    (int32_t)r.a[0] != 0) {
++			return;
++		}
++		if (r.a[1]) {
++			available |= 1u << queries[i].cmd;
++		}
++	}
++	/* The last availability result describes the query itself, not PAS id 13. */
++	if (r.a[1] != 0) {
++		if (!scm_logged_query("PAS GPU id 13 supported", mask | SCM_PAS_SUPPORTED,
++		    SCM_PAS_GPU, false, &r) || (int32_t)r.a[0] != 0) {
++			return;
++		}
++	}
++	printf("SWEET SCM: availability probe complete\n");
++	sweet_log_sync();
++	if (enabled >= 2) {
++		scm_crypto_resources();
++	}
++	if (enabled >= 3) {
++		printf("SWEET SCM: enabling crypto bandwidth prerequisite\n");
++		sweet_log_sync();
++		int error = sweet_rpmh_crypto_bw();
++		printf("SWEET SCM: crypto bandwidth result errno=%d\n", error);
++		sweet_log_sync();
++		if (!error) {
++			scm_crypto_resources();
++			const uint32_t needed = (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6);
++			scm_zap_ready = enabled == 4 && mask == SCM_64 && (available & needed) == needed;
++			printf("SWEET SCM: signed zap test ready=%u (requires sweetgpu=7)\n", scm_zap_ready);
++			sweet_log_sync();
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,8 @@
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
++bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_scm.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
